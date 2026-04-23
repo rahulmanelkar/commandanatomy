@@ -1,0 +1,7 @@
+# Build artifacts
+apps/ls/ls
+apps/ls/libls.a
+apps/ls/*.o
+apps/stat/stat
+apps/stat/libstat.a
+apps/stat/*.o
