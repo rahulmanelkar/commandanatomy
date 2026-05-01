@@ -126,9 +126,11 @@ static int list_file_json(const char *path)
         type = entry_type(st.st_mode);
         size = (long long)st.st_size;
     }
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
     printf("{\n  \"path\": \"%s\",\n  \"entries\": [\n", path);
     printf("    {\"name\": \"%s\", \"type\": \"%s\", \"size\": %lld}\n",
-           path, type, size);
+           name, type, size);
     printf("  ]\n}\n");
     return 0;
 }
@@ -198,6 +200,9 @@ int ls_run(int argc, char **argv)
 
     int multi = (n > 1);   /* print header per directory when listing several */
 
+    if (use_json && multi) printf("[\n");
+
+    int json_first = 1;
     for (int i = 0; i < n; i++) {
         const char *p = targets[i];
         struct stat st;
@@ -206,6 +211,11 @@ int ls_run(int argc, char **argv)
             fprintf(stderr, "ls: cannot access '%s': %s\n", p, strerror(errno));
             ret = 1;
             continue;
+        }
+
+        if (use_json && multi) {
+            if (!json_first) printf(",\n");
+            json_first = 0;
         }
 
         if (S_ISDIR(st.st_mode)) {
@@ -220,6 +230,8 @@ int ls_run(int argc, char **argv)
                             : list_file_plain(p);
         }
     }
+
+    if (use_json && multi) printf("]\n");
 
     arg_freetable(argtable, 5);
     return ret;

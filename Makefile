@@ -1,4 +1,4 @@
-APPS = ls stat
+APPS = hello ls stat wc cat
 
 .PHONY: all clean $(APPS)
 
