@@ -37,6 +37,14 @@ extern cmd_spec_t cmd_stat_spec;
 extern cmd_spec_t cmd_wc_spec;
 extern cmd_spec_t cmd_cat_spec;
 
+/*
+ * When the shell reads commands from a piped/redirected stdin (not a tty and
+ * not a named script file), we dup stdin to a fresh fd and read from that.
+ * This leaves fd 0 clean for forked children so they inherit an unmolested
+ * stdin rather than a FILE* buffer full of buffered command text.
+ */
+static int g_cmd_fd = -1;   /* set in main(), closed in every fork child */
+
 /* ── in-shell command registry ──────────────────────────────────────────── */
 
 #define REGISTRY_MAX 64
@@ -188,6 +196,7 @@ static int run_inproc(stage_t *s)
         if (pid == 0) {
             signal(SIGINT, SIG_DFL);
             signal(SIGPIPE, SIG_DFL);
+            if (g_cmd_fd >= 0) close(g_cmd_fd);
             execvp(s->argv[0], s->argv);
             fprintf(stderr, "mysh: %s: %s\n", s->argv[0], strerror(errno));
             _exit(127);
@@ -228,6 +237,10 @@ static int run_pipeline(stage_t *stages, int nstages)
         if (pid == 0) {
             signal(SIGINT,  SIG_DFL);
             signal(SIGPIPE, SIG_DFL);
+
+            /* Close the dup'd command-reading fd so fd 0 is the only handle
+             * on the original stdin pipe and the child inherits a clean fd 0. */
+            if (g_cmd_fd >= 0) close(g_cmd_fd);
 
             if (prev_rd != STDIN_FILENO)  { dup2(prev_rd, STDIN_FILENO);  close(prev_rd);  }
             if (wr_fd   != STDOUT_FILENO) { dup2(wr_fd,   STDOUT_FILENO); close(wr_fd);    }
@@ -328,10 +341,27 @@ int main(int argc, char **argv)
             fprintf(stderr, "mysh: %s: %s\n", argv[1], strerror(errno));
             return 1;
         }
+    } else if (!isatty(STDIN_FILENO)) {
+        /*
+         * stdin is a pipe or redirect.  Dup it to a fresh fd and read
+         * commands from there, leaving fd 0 untouched.  Forked pipeline
+         * children then inherit a clean fd 0 with no buffered command text.
+         */
+        g_cmd_fd = dup(STDIN_FILENO);
+        if (g_cmd_fd >= 0) {
+            input = fdopen(g_cmd_fd, "r");
+            if (!input) { close(g_cmd_fd); g_cmd_fd = -1; /* fall back */ }
+        }
     }
 
     int interactive = isatty(fileno(input));
     int last_status = 0;
+
+    /* Seed OLDPWD so 'cd -' works from the very first cd. */
+    {
+        char cwd[4096];
+        if (getcwd(cwd, sizeof cwd)) setenv("OLDPWD", cwd, 0);
+    }
 
     if (interactive) {
         printf("mysh — type 'help' for available commands, 'exit' to quit\n");
@@ -382,16 +412,28 @@ int main(int argc, char **argv)
             }
 
             if (strcmp(cmd, "cd") == 0) {
-                const char *dir = (stages[0].argc >= 2)
-                                  ? stages[0].argv[1]
-                                  : getenv("HOME");
-                if (!dir) {
-                    fprintf(stderr, "mysh: cd: HOME not set\n");
-                    last_status = 1;
-                } else if (chdir(dir) < 0) {
+                const char *arg = (stages[0].argc >= 2) ? stages[0].argv[1] : NULL;
+                const char *dir;
+
+                if (!arg) {
+                    dir = getenv("HOME");
+                    if (!dir) { fprintf(stderr, "mysh: cd: HOME not set\n"); last_status = 1; tok_free(&tok); continue; }
+                } else if (strcmp(arg, "-") == 0) {
+                    dir = getenv("OLDPWD");
+                    if (!dir) { fprintf(stderr, "mysh: cd: OLDPWD not set\n"); last_status = 1; tok_free(&tok); continue; }
+                    printf("%s\n", dir);  /* bash prints the new directory for cd - */
+                } else {
+                    dir = arg;
+                }
+
+                char prev[4096];
+                if (!getcwd(prev, sizeof prev)) prev[0] = '\0';
+
+                if (chdir(dir) < 0) {
                     fprintf(stderr, "mysh: cd: %s: %s\n", dir, strerror(errno));
                     last_status = 1;
                 } else {
+                    if (prev[0]) setenv("OLDPWD", prev, 1);
                     last_status = 0;
                 }
                 tok_free(&tok);
