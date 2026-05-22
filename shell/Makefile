@@ -11,7 +11,11 @@ APP_OBJS = ../apps/hello/cmd_hello.o \
            ../apps/ls/cmd_ls.o       \
            ../apps/stat/cmd_stat.o   \
            ../apps/wc/cmd_wc.o       \
-           ../apps/cat/cmd_cat.o
+           ../apps/cat/cmd_cat.o     \
+           ../apps/echo/cmd_echo.o   \
+           ../apps/head/cmd_head.o   \
+           ../apps/tail/cmd_tail.o   \
+           ../apps/grep/cmd_grep.o
 
 .PHONY: all clean apps
 
@@ -23,6 +27,10 @@ apps:
 	$(MAKE) -C ../apps/stat
 	$(MAKE) -C ../apps/wc
 	$(MAKE) -C ../apps/cat
+	$(MAKE) -C ../apps/echo
+	$(MAKE) -C ../apps/head
+	$(MAKE) -C ../apps/tail
+	$(MAKE) -C ../apps/grep
 
 mysh: mysh.o tok.o argtable3.o $(APP_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)

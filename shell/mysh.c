@@ -36,6 +36,10 @@ extern cmd_spec_t cmd_ls_spec;
 extern cmd_spec_t cmd_stat_spec;
 extern cmd_spec_t cmd_wc_spec;
 extern cmd_spec_t cmd_cat_spec;
+extern cmd_spec_t cmd_echo_spec;
+extern cmd_spec_t cmd_head_spec;
+extern cmd_spec_t cmd_tail_spec;
+extern cmd_spec_t cmd_grep_spec;
 
 /*
  * When the shell reads commands from a piped/redirected stdin (not a tty and
@@ -325,6 +329,10 @@ int main(int argc, char **argv)
     reg_register(&cmd_stat_spec);
     reg_register(&cmd_wc_spec);
     reg_register(&cmd_cat_spec);
+    reg_register(&cmd_echo_spec);
+    reg_register(&cmd_head_spec);
+    reg_register(&cmd_tail_spec);
+    reg_register(&cmd_grep_spec);
 
     setup_path();
 
