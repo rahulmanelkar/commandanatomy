@@ -498,16 +498,45 @@ mysh> mytool          # found via ~/.mysh/bin
 
 ```sh
 mysh> ls apps
-hello  ls  stat  wc  cat  pkg
+cat  echo  grep  head  hello  ls  pkg  stat  tail  wc
 
 mysh> echo "one two three" | wc -w
        3
+
+mysh> echo -e "line1\nline2\nline3" | head -n 2
+line1
+line2
+
+mysh> echo -e "line1\nline2\nline3" | tail -n 1
+line3
+
+mysh> grep -n include apps/cat/cmd_cat.c | head -n 5
+1:#include <stdio.h>
+2:#include <stdlib.h>
+3:#include <string.h>
+4:#include <errno.h>
+5:#include "argtable3.h"
 
 mysh> cat apps/hello/hello_main.c | wc -l
        8
 
 mysh> wc -l < apps/pkg/pkg.c
      591 apps/pkg/pkg.c
+
+mysh> grep -c "^#include" apps/cat/cmd_cat.c apps/wc/cmd_wc.c
+apps/cat/cmd_cat.c:4
+apps/wc/cmd_wc.c:5
+
+mysh> head -n 3 apps/cat/cmd_cat.c apps/wc/cmd_wc.c
+==> apps/cat/cmd_cat.c <==
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+==> apps/wc/cmd_wc.c <==
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 mysh> cd /tmp && pwd
 /tmp
@@ -527,6 +556,10 @@ Registered commands:
   stat             display file status
   wc               count lines, words, and bytes
   cat              concatenate files and print to standard output
+  echo             display a line of text
+  head             print the first lines of files
+  tail             print the last lines of files
+  grep             search for patterns in files
 
 All other commands are looked up in PATH.
 
