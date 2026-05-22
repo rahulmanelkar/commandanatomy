@@ -15,7 +15,12 @@ rahulbox/
 │   ├── ls/                 # list directory contents
 │   ├── stat/               # display file status
 │   ├── wc/                 # count lines, words, and bytes
-│   └── cat/                # concatenate and print files
+│   ├── cat/                # concatenate and print files
+│   └── pkg/                # local package manager
+├── shell/
+│   ├── mysh.c              # shell main loop + execution engine
+│   ├── tok.c / tok.h       # quote-aware tokenizer
+│   └── Makefile
 ├── Makefile                # top-level build coordinator
 └── CommandAnatomy.ipynb    # course notebook and architecture guide
 ```
@@ -30,7 +35,7 @@ No other dependencies — `argtable3` is vendored under `vendor/`.
 
 ## Building
 
-Build all commands from the project root:
+Build everything (all commands + the shell) from the project root:
 
 ```sh
 make
@@ -42,17 +47,25 @@ Clean all build artifacts:
 make clean
 ```
 
+Build only the shell (also builds any app dependencies):
+
+```sh
+make shell
+# or directly:
+make -C shell
+```
+
 Build a single command:
 
 ```sh
 make -C apps/ls
-make -C apps/stat
 make -C apps/wc
 make -C apps/cat
 make -C apps/hello
+make -C apps/pkg
 ```
 
-Binaries are produced inside each app's directory (e.g. `apps/ls/ls`). Each app also produces a static library (e.g. `apps/ls/libls.a`) for linking into the shell.
+Each app produces a standalone binary (e.g. `apps/ls/ls`) and a static library (e.g. `apps/ls/libls.a`). The shell links the `.o` files directly from each app so there is only one copy of `argtable3` in the final binary.
 
 ## Commands
 
@@ -223,6 +236,151 @@ apps/cat/cat --json apps/cat/cat_main.c
 # JSON from stdin
 echo "hello" | apps/cat/cat --json
 # [{"content": "hello\n"}]
+```
+
+---
+
+### `pkg` — local package manager
+
+```sh
+apps/pkg/pkg <subcommand> [args]
+```
+
+Packages are `.tar.gz` archives containing a `pkg.json` manifest plus any files to install. They install under `~/.mysh/pkgs/<name>-<version>/` and declared binaries are symlinked into `~/.mysh/bin/`.
+
+**`pkg.json` format:**
+
+```json
+{
+  "name": "mypkg",
+  "version": "1.0.0",
+  "description": "What this package does",
+  "bin": ["myscript.sh"]
+}
+```
+
+| Subcommand | Description |
+|---|---|
+| `build <src-dir> <output.tar.gz>` | Pack a directory into a package archive |
+| `install <pkg.tar.gz>` | Extract and install; symlink declared binaries |
+| `list` | List installed packages with descriptions |
+| `remove <name> [version]` | Remove a package and its bin symlinks |
+
+**Examples:**
+
+```sh
+# Pack a directory
+apps/pkg/pkg build myapp/ myapp-1.0.0.tar.gz
+
+# Install it
+apps/pkg/pkg install myapp-1.0.0.tar.gz
+# Installed to ~/.mysh/pkgs/myapp-1.0.0/
+# Symlinked ~/.mysh/bin/myscript.sh -> ~/.mysh/pkgs/myapp-1.0.0/myscript.sh
+
+# List what's installed
+apps/pkg/pkg list
+
+# Remove by name (latest version) or exact version
+apps/pkg/pkg remove myapp
+apps/pkg/pkg remove myapp 1.0.0
+```
+
+`~/.mysh/bin` is automatically added to `PATH` by the shell on startup, so installed binaries are immediately available after `pkg install`.
+
+---
+
+## Shell (`mysh`)
+
+```sh
+shell/mysh              # interactive mode
+shell/mysh script.sh    # run a script file
+```
+
+`mysh` is a small Unix shell that runs all registered commands in-process (no fork overhead for `ls`, `wc`, `cat`, etc.) and falls back to `fork` + `execvp` for anything else in `PATH`.
+
+### Starting the shell
+
+```sh
+# Build and launch interactively
+make && shell/mysh
+```
+
+```
+mysh — type 'help' for available commands, 'exit' to quit
+mysh>
+```
+
+The prompt shows the last exit code when non-zero: `mysh [1]> `.
+
+### Features
+
+| Feature | Example |
+|---|---|
+| Registered commands (in-process) | `ls -a`, `wc -l file`, `cat file`, `hello --name X`, `stat file` |
+| External commands (via PATH) | `git status`, `python3 script.py` |
+| Input redirection | `wc -l < file.txt` |
+| Output redirection | `ls > out.txt` |
+| Append redirection | `echo "line" >> log.txt` |
+| Pipelines | `ls \| sort \| wc -l` |
+| Single and double quoting | `echo 'hello world'`, `echo "hi $USER"` |
+| Comments | `# this line is ignored` |
+| Script files | `mysh deploy.sh` |
+
+### Built-in commands
+
+| Command | Description |
+|---|---|
+| `cd [DIR]` | Change directory; `cd` alone goes to `$HOME`; `cd -` returns to previous directory |
+| `exit [N]` | Exit with optional status code (defaults to last exit status) |
+| `help` | List all built-ins and registered commands |
+
+### PATH integration
+
+On startup, `mysh` prepends `~/.mysh/bin` to `PATH` if it exists. Combined with `pkg install`, this means installed packages are available immediately:
+
+```sh
+apps/pkg/pkg install mytool-1.0.0.tar.gz
+shell/mysh
+mysh> mytool          # found via ~/.mysh/bin
+```
+
+### Example session
+
+```sh
+mysh> ls apps
+hello  ls  stat  wc  cat  pkg
+
+mysh> echo "one two three" | wc -w
+       3
+
+mysh> cat apps/hello/hello_main.c | wc -l
+       8
+
+mysh> wc -l < apps/pkg/pkg.c
+     591 apps/pkg/pkg.c
+
+mysh> cd /tmp && pwd
+/tmp
+
+mysh> cd -
+/home/user/rahulbox
+
+mysh> help
+Built-in commands:
+  cd [DIR]         change working directory (default: $HOME)
+  exit [N]         exit the shell with optional status N
+  help             show this help
+
+Registered commands:
+  hello            print a friendly greeting
+  ls               list directory contents
+  stat             display file status
+  wc               count lines, words, and bytes
+  cat              concatenate files and print to standard output
+
+All other commands are looked up in PATH.
+
+mysh> exit
 ```
 
 ## Command Anatomy
