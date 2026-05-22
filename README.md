@@ -16,6 +16,10 @@ rahulbox/
 │   ├── stat/               # display file status
 │   ├── wc/                 # count lines, words, and bytes
 │   ├── cat/                # concatenate and print files
+│   ├── echo/               # display a line of text
+│   ├── head/               # print the first lines of files
+│   ├── tail/               # print the last lines of files
+│   ├── grep/               # search for patterns in files
 │   └── pkg/                # local package manager
 ├── shell/
 │   ├── mysh.c              # shell main loop + execution engine
@@ -61,6 +65,10 @@ Build a single command:
 make -C apps/ls
 make -C apps/wc
 make -C apps/cat
+make -C apps/echo
+make -C apps/head
+make -C apps/tail
+make -C apps/grep
 make -C apps/hello
 make -C apps/pkg
 ```
@@ -240,6 +248,148 @@ echo "hello" | apps/cat/cat --json
 
 ---
 
+### `echo` — display a line of text
+
+```sh
+apps/echo/echo [OPTIONS] [STRING...]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-n` | Do not output trailing newline |
+| `-e` | Enable interpretation of backslash escapes (`\n`, `\t`, `\\`, etc.) |
+| `--json` | Machine-readable JSON output |
+
+**Examples:**
+
+```sh
+apps/echo/echo hello world
+# hello world
+
+apps/echo/echo -n "no newline"
+
+apps/echo/echo -e "line1\nline2"
+
+apps/echo/echo --json hello world
+# {"output": "hello world\n"}
+```
+
+---
+
+### `head` — print the first lines of files
+
+```sh
+apps/head/head [OPTIONS] [FILE...]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-n NUM`, `--lines=NUM` | Print first NUM lines (default: 10) |
+| `-c NUM`, `--bytes=NUM` | Print first NUM bytes |
+| `--json` | Machine-readable JSON output |
+
+Reads stdin when no files are given. With multiple files, prints a `==> file <==` header before each. Use `-` as a filename to read from stdin.
+
+**Examples:**
+
+```sh
+# First 10 lines of a file
+apps/head/head apps/cat/cmd_cat.c
+
+# First 5 lines
+apps/head/head -n 5 apps/cat/cmd_cat.c
+
+# First 100 bytes
+apps/head/head -c 100 apps/cat/cmd_cat.c
+
+# JSON output
+apps/head/head --json -n 3 apps/cat/cmd_cat.c
+# [{"file": "apps/cat/cmd_cat.c", "content": "#include <stdio.h>\n..."}]
+```
+
+---
+
+### `tail` — print the last lines of files
+
+```sh
+apps/tail/tail [OPTIONS] [FILE...]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-n NUM`, `--lines=NUM` | Print last NUM lines (default: 10) |
+| `-c NUM`, `--bytes=NUM` | Print last NUM bytes |
+| `--json` | Machine-readable JSON output |
+
+Reads stdin when no files are given. With multiple files, prints a `==> file <==` header before each.
+
+**Examples:**
+
+```sh
+# Last 10 lines
+apps/tail/tail apps/cat/cmd_cat.c
+
+# Last 5 lines
+apps/tail/tail -n 5 apps/cat/cmd_cat.c
+
+# Last 50 bytes
+apps/tail/tail -c 50 apps/cat/cmd_cat.c
+
+# JSON output
+apps/tail/tail --json -n 3 apps/cat/cmd_cat.c
+# [{"file": "apps/cat/cmd_cat.c", "content": "...\n"}]
+```
+
+---
+
+### `grep` — search for patterns in files
+
+```sh
+apps/grep/grep [OPTIONS] PATTERN [FILE...]
+```
+
+`PATTERN` is a POSIX extended regular expression.
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-i`, `--ignore-case` | Ignore case distinctions in PATTERN |
+| `-n`, `--line-number` | Prefix each match with its line number |
+| `-c`, `--count` | Print only a count of matching lines per file |
+| `-v`, `--invert-match` | Select non-matching lines |
+| `-l`, `--files-with-matches` | Print only names of files containing matches |
+| `--json` | Machine-readable JSON output |
+
+Exit status: 0 if a match was found, 1 if no match, 2 on error.
+
+**Examples:**
+
+```sh
+# Basic search
+apps/grep/grep include apps/cat/cmd_cat.c
+
+# Case-insensitive with line numbers
+apps/grep/grep -in stdio apps/cat/cmd_cat.c
+
+# Count matches per file
+apps/grep/grep -c include apps/cat/cmd_cat.c apps/wc/cmd_wc.c
+
+# Invert match (non-matching lines)
+apps/grep/grep -v '^#' apps/cat/cmd_cat.c
+
+# Files containing the pattern
+apps/grep/grep -l arg_lit apps/*/cmd_*.c
+
+# JSON output
+apps/grep/grep --json include apps/cat/cmd_cat.c
+# [{"file": "apps/cat/cmd_cat.c", "matches": [{"line": 1, "text": "#include <stdio.h>\n"}, ...]}]
+```
+
+---
+
 ### `pkg` — local package manager
 
 ```sh
@@ -316,7 +466,7 @@ The prompt shows the last exit code when non-zero: `mysh [1]> `.
 
 | Feature | Example |
 |---|---|
-| Registered commands (in-process) | `ls -a`, `wc -l file`, `cat file`, `hello --name X`, `stat file` |
+| Registered commands (in-process) | `ls -a`, `wc -l file`, `cat file`, `echo hello`, `head -n 5 file`, `tail -n 5 file`, `grep foo file`, `hello --name X`, `stat file` |
 | External commands (via PATH) | `git status`, `python3 script.py` |
 | Input redirection | `wc -l < file.txt` |
 | Output redirection | `ls > out.txt` |
