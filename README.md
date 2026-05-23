@@ -20,6 +20,10 @@ rahulbox/
 │   ├── head/               # print the first lines of files
 │   ├── tail/               # print the last lines of files
 │   ├── grep/               # search for patterns in files
+│   ├── sort/               # sort lines of text files
+│   ├── uniq/               # report or omit repeated adjacent lines
+│   ├── cut/                # remove sections from each line of files
+│   ├── tee/                # read from stdin and write to stdout and files
 │   └── pkg/                # local package manager
 ├── shell/
 │   ├── mysh.c              # shell main loop + execution engine
@@ -69,6 +73,10 @@ make -C apps/echo
 make -C apps/head
 make -C apps/tail
 make -C apps/grep
+make -C apps/sort
+make -C apps/uniq
+make -C apps/cut
+make -C apps/tee
 make -C apps/hello
 make -C apps/pkg
 ```
@@ -390,6 +398,167 @@ apps/grep/grep --json include apps/cat/cmd_cat.c
 
 ---
 
+### `sort` — sort lines of text files
+
+```sh
+apps/sort/sort [OPTIONS] [FILE...]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-n`, `--numeric-sort` | Compare fields as numeric values |
+| `-r`, `--reverse` | Reverse the sort order |
+| `-u`, `--unique` | Output only the first of equal lines |
+| `-k FIELD`, `--key=FIELD` | Sort by column number (1-based) |
+| `-t SEP` | Field separator (default: whitespace) |
+| `--json` | Machine-readable JSON output |
+
+Reads from stdin when no files are given. All inputs are merged before sorting.
+
+**Examples:**
+
+```sh
+# Alphabetic sort
+apps/sort/sort apps/ls/cmd_ls.c
+
+# Numeric sort, reverse
+printf "3\n1\n10\n2\n" | apps/sort/sort -n -r
+# 10 3 2 1
+
+# Sort and deduplicate
+printf "banana\napple\nbanana\n" | apps/sort/sort -u
+# apple banana
+
+# Sort CSV by second column numerically
+printf "alice,30\nbob,25\ncarol,35\n" | apps/sort/sort -t, -k2 -n
+# bob,25 alice,30 carol,35
+
+# JSON output
+printf "cherry\napple\nbanana\n" | apps/sort/sort --json
+# ["apple", "banana", "cherry"]
+```
+
+---
+
+### `uniq` — report or omit repeated adjacent lines
+
+```sh
+apps/uniq/uniq [OPTIONS] [INPUT [OUTPUT]]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-c`, `--count` | Prefix lines with number of occurrences |
+| `-d`, `--repeated` | Only print lines that occur more than once |
+| `-u`, `--unique` | Only print lines that occur exactly once |
+| `--json` | Machine-readable JSON output |
+
+Operates on **adjacent** lines — pipe through `sort` first to deduplicate globally.
+
+**Examples:**
+
+```sh
+# Remove adjacent duplicates
+printf "a\na\nb\nc\nc\n" | apps/uniq/uniq
+# a b c
+
+# Show counts
+printf "a\na\nb\nc\nc\nc\n" | apps/uniq/uniq -c
+#       2 a
+#       1 b
+#       3 c
+
+# Show only lines that appear more than once
+printf "a\na\nb\nc\nc\n" | apps/uniq/uniq -d
+# a c
+
+# Full dedup pipeline: sort then uniq
+cat apps/*/cmd_*.c | grep "^#include" | sort | apps/uniq/uniq -c | sort -rn | head -5
+
+# JSON output
+printf "a\na\nb\n" | apps/uniq/uniq --json
+# [{"count": 2, "line": "a"}, {"count": 1, "line": "b"}]
+```
+
+---
+
+### `cut` — remove sections from each line of files
+
+```sh
+apps/cut/cut [OPTIONS] [FILE...]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-f LIST`, `--fields=LIST` | Select fields (e.g. `1,3` or `1-3,5`) |
+| `-c LIST`, `--characters=LIST` | Select character positions |
+| `-d DELIM`, `--delimiter=DELIM` | Field delimiter (default: TAB) |
+| `--json` | Machine-readable JSON output |
+
+`LIST` is a comma-separated sequence of numbers or ranges (e.g. `1,3-5,7`). Use `-f` for delimited fields or `-c` for byte positions; they cannot be combined.
+
+**Examples:**
+
+```sh
+# First field of colon-delimited file
+cut -f1 -d: /etc/passwd | apps/cut/cut -f1 -d:
+
+# Fields 1 and 3 from CSV
+printf "a,b,c\n1,2,3\n" | apps/cut/cut -f1,3 -d,
+# a,c
+# 1,3
+
+# Character positions 1-3
+printf "abcdef\n123456\n" | apps/cut/cut -c1-3
+# abc
+# 123
+
+# Extract filename extensions
+ls apps/cat/ | apps/cut/cut -f2 -d.
+
+# JSON output
+printf "foo:bar:baz\n" | apps/cut/cut -d: -f2 --json
+# [{"lines": ["bar"]}]
+```
+
+---
+
+### `tee` — read from stdin and write to stdout and files
+
+```sh
+apps/tee/tee [OPTIONS] [FILE...]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-a`, `--append` | Append to files instead of overwriting |
+| `--json` | Machine-readable JSON output |
+
+Reads all of stdin and writes it simultaneously to standard output and each `FILE`. Useful mid-pipeline when you want to capture an intermediate result without breaking the pipe.
+
+**Examples:**
+
+```sh
+# Capture intermediate output while passing through
+ls apps/ | apps/tee/tee /tmp/app_list.txt | wc -l
+
+# Append to a log
+echo "build started" | apps/tee/tee -a build.log
+
+# Write the same content to multiple files
+echo "hello" | apps/tee/tee file1.txt file2.txt
+
+# JSON output (captures content + byte count)
+echo "hello world" | apps/tee/tee --json
+# {"bytes_read": 12, "content": "hello world\n"}
+```
+
+---
+
 ### `pkg` — local package manager
 
 ```sh
@@ -466,7 +635,7 @@ The prompt shows the last exit code when non-zero: `mysh [1]> `.
 
 | Feature | Example |
 |---|---|
-| Registered commands (in-process) | `ls -a`, `wc -l file`, `cat file`, `echo hello`, `head -n 5 file`, `tail -n 5 file`, `grep foo file`, `hello --name X`, `stat file` |
+| Registered commands (in-process) | `ls -a`, `wc -l file`, `cat file`, `echo hello`, `head -n 5 file`, `tail -n 5 file`, `grep foo file`, `sort -n`, `uniq -c`, `cut -f1 -d:`, `tee out.txt`, `stat file` |
 | External commands (via PATH) | `git status`, `python3 script.py` |
 | Input redirection | `wc -l < file.txt` |
 | Output redirection | `ls > out.txt` |
@@ -498,7 +667,7 @@ mysh> mytool          # found via ~/.mysh/bin
 
 ```sh
 mysh> ls apps
-cat  echo  grep  head  hello  ls  pkg  stat  tail  wc
+cat  cut  echo  grep  head  hello  ls  pkg  sort  stat  tail  tee  uniq  wc
 
 mysh> echo "one two three" | wc -w
        3
@@ -517,26 +686,21 @@ mysh> grep -n include apps/cat/cmd_cat.c | head -n 5
 4:#include <errno.h>
 5:#include "argtable3.h"
 
+mysh> grep "^#include" apps/*/cmd_*.c | cut -f2 -d: | sort | uniq -c | sort -rn | head -5
+      9 #include <stdio.h>
+      9 #include <stdlib.h>
+      9 #include <string.h>
+      8 #include "argtable3.h"
+      8 #include "cmd_spec.h"
+
+mysh> ls apps | tee /tmp/apps.txt | wc -l
+      14
+
 mysh> cat apps/hello/hello_main.c | wc -l
        8
 
 mysh> wc -l < apps/pkg/pkg.c
      591 apps/pkg/pkg.c
-
-mysh> grep -c "^#include" apps/cat/cmd_cat.c apps/wc/cmd_wc.c
-apps/cat/cmd_cat.c:4
-apps/wc/cmd_wc.c:5
-
-mysh> head -n 3 apps/cat/cmd_cat.c apps/wc/cmd_wc.c
-==> apps/cat/cmd_cat.c <==
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-==> apps/wc/cmd_wc.c <==
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 mysh> cd /tmp && pwd
 /tmp
@@ -560,6 +724,10 @@ Registered commands:
   head             print the first lines of files
   tail             print the last lines of files
   grep             search for patterns in files
+  sort             sort lines of text files
+  uniq             report or omit repeated adjacent lines
+  cut              remove sections from each line of files
+  tee              read from stdin and write to stdout and files
 
 All other commands are looked up in PATH.
 
