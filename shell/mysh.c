@@ -201,17 +201,19 @@ static int run_inproc(stage_t *s)
     } else {
         /* External command: fork so the child can exec without disturbing us. */
         pid_t pid = fork();
-        if (pid == 0) {
+        if (pid < 0) { perror("fork"); rc = 1; }
+        else if (pid == 0) {
             signal(SIGINT, SIG_DFL);
             signal(SIGPIPE, SIG_DFL);
             if (g_cmd_fd >= 0) close(g_cmd_fd);
             execvp(s->argv[0], s->argv);
             fprintf(stderr, "mysh: %s: %s\n", s->argv[0], strerror(errno));
             _exit(127);
+        } else {
+            int status;
+            waitpid(pid, &status, 0);
+            rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
         }
-        int status;
-        waitpid(pid, &status, 0);
-        rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
     }
 
     if (saved_in  >= 0) { dup2(saved_in,  STDIN_FILENO);  close(saved_in);  }
