@@ -2,6 +2,8 @@
 
 A custom Unix shell ecosystem built in C. Each command follows a standard **Command Anatomy** (`cmd_spec_t`) that unifies CLI parsing, `--help` output, shell built-in registration, and package documentation — all driven by a single `argtable3` definition per command.
 
+See [DESIGN.md](DESIGN.md) for full technical design documentation.
+
 ## Project structure
 
 ```
