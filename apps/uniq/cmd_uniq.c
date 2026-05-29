@@ -18,7 +18,7 @@ static void build_uniq_argtable(
     struct arg_file **infile,
     struct arg_file **outfile,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 9 slots */
 {
     *help     = arg_lit0("h", "help",           "show this help and exit");
     *count    = arg_lit0("c", "count",          "prefix lines with number of occurrences");
@@ -29,7 +29,6 @@ static void build_uniq_argtable(
     *outfile  = arg_file0(NULL, NULL, "[OUTPUT]", "output file (default: stdout)");
     *end      = arg_end(20);
 
-    static void *tbl[9];
     tbl[0] = *help;
     tbl[1] = *count;
     tbl[2] = *repeated;
@@ -39,8 +38,6 @@ static void build_uniq_argtable(
     tbl[6] = *outfile;
     tbl[7] = *end;
     tbl[8] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -114,44 +111,44 @@ void uniq_print_usage(FILE *out)
     struct arg_lit  *help, *count, *repeated, *unique, *json;
     struct arg_file *infile, *outfile;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[9];
 
     build_uniq_argtable(&help, &count, &repeated, &unique, &json,
-                        &infile, &outfile, &end, &argtable);
+                        &infile, &outfile, &end, tbl);
 
     fprintf(out, "Usage: uniq ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nFilter adjacent matching lines from INPUT (or stdin).\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-22s %s\n");
+    arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(argtable, 8);
+    arg_freetable(tbl, 8);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int uniq_run(int argc, char **argv)
+int uniq_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
     struct arg_lit  *help, *count, *repeated, *unique, *json;
     struct arg_file *infile, *outfile;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[9];
 
     build_uniq_argtable(&help, &count, &repeated, &unique, &json,
-                        &infile, &outfile, &end, &argtable);
+                        &infile, &outfile, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        uniq_print_usage(stdout);
-        arg_freetable(argtable, 8);
+        uniq_print_usage(out_stream);
+        arg_freetable(tbl, 8);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "uniq");
         fprintf(stderr, "Try 'uniq --help' for more information.\n");
-        arg_freetable(argtable, 8);
+        arg_freetable(tbl, 8);
         return 1;
     }
 
@@ -160,23 +157,23 @@ int uniq_run(int argc, char **argv)
     int use_unique   = unique->count   > 0;
     int use_json     = json->count     > 0;
 
-    FILE *fp  = stdin;
-    FILE *out = stdout;
+    FILE *fp  = in_stream;
+    FILE *dest = out_stream;
 
     if (infile->count > 0) {
         fp = fopen(infile->filename[0], "r");
         if (!fp) {
             fprintf(stderr, "uniq: %s: %s\n", infile->filename[0], strerror(errno));
-            arg_freetable(argtable, 8);
+            arg_freetable(tbl, 8);
             return 1;
         }
     }
     if (outfile->count > 0) {
-        out = fopen(outfile->filename[0], "w");
-        if (!out) {
+        dest = fopen(outfile->filename[0], "w");
+        if (!dest) {
             fprintf(stderr, "uniq: %s: %s\n", outfile->filename[0], strerror(errno));
-            if (fp != stdin) fclose(fp);
-            arg_freetable(argtable, 8);
+            if (fp != in_stream) fclose(fp);
+            arg_freetable(tbl, 8);
             return 1;
         }
     }
@@ -185,12 +182,12 @@ int uniq_run(int argc, char **argv)
     int      n    = 0;
     int      rc   = collect_entries(fp, &ents, &n);
 
-    if (fp != stdin)  fclose(fp);
+    if (fp != in_stream)  fclose(fp);
 
     if (rc < 0) {
         fprintf(stderr, "uniq: read error or out of memory\n");
-        if (out != stdout) fclose(out);
-        arg_freetable(argtable, 8);
+        if (dest != out_stream) fclose(dest);
+        arg_freetable(tbl, 8);
         return 1;
     }
 
@@ -203,7 +200,7 @@ int uniq_run(int argc, char **argv)
         emit_count++;
     }
 
-    if (use_json) fprintf(out, "[\n");
+    if (use_json) fprintf(dest, "[\n");
 
     int emitted = 0;
     for (int i = 0; i < n; i++) {
@@ -215,23 +212,23 @@ int uniq_run(int argc, char **argv)
 
         emitted++;
         if (use_json) {
-            fprintf(out, "  {\"count\": %d, \"line\": \"", ents[i].hits);
-            json_escape(out, ents[i].text, slen);
-            fprintf(out, "\"}%s\n", emitted == emit_count ? "" : ",");
+            fprintf(dest, "  {\"count\": %d, \"line\": \"", ents[i].hits);
+            json_escape(dest, ents[i].text, slen);
+            fprintf(dest, "\"}%s\n", emitted == emit_count ? "" : ",");
         } else {
             if (use_count)
-                fprintf(out, "%7d ", ents[i].hits);
-            fwrite(ents[i].text, 1, ents[i].len, out);
+                fprintf(dest, "%7d ", ents[i].hits);
+            fwrite(ents[i].text, 1, ents[i].len, dest);
         }
     }
 
-    if (use_json) fprintf(out, "]\n");
+    if (use_json) fprintf(dest, "]\n");
 
     for (int i = 0; i < n; i++) free(ents[i].text);
     free(ents);
 
-    if (out != stdout) fclose(out);
-    arg_freetable(argtable, 8);
+    if (dest != out_stream) fclose(dest);
+    arg_freetable(tbl, 8);
     return 0;
 }
 

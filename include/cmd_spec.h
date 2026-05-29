@@ -7,7 +7,7 @@ typedef struct cmd_spec {
     const char *name;
     const char *summary;
     const char *long_help;
-    int  (*run)(int argc, char **argv);
+    int  (*run)(int argc, char **argv, FILE *in_stream, FILE *out_stream);
     void (*print_usage)(FILE *out);
 } cmd_spec_t;
 

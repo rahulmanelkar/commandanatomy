@@ -15,7 +15,7 @@ static void build_tee_argtable(
     struct arg_lit  **json,
     struct arg_file **files,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 6 slots */
 {
     *help   = arg_lit0("h", "help",   "show this help and exit");
     *append = arg_lit0("a", "append", "append to files instead of overwriting");
@@ -23,15 +23,12 @@ static void build_tee_argtable(
     *files  = arg_filen(NULL, NULL, "[FILE...]", 0, 64, "files to write to (in addition to stdout)");
     *end    = arg_end(20);
 
-    static void *tbl[6];
     tbl[0] = *help;
     tbl[1] = *append;
     tbl[2] = *json;
     tbl[3] = *files;
     tbl[4] = *end;
     tbl[5] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -61,42 +58,42 @@ void tee_print_usage(FILE *out)
     struct arg_lit  *help, *append, *json;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[6];
 
-    build_tee_argtable(&help, &append, &json, &files, &end, &argtable);
+    build_tee_argtable(&help, &append, &json, &files, &end, tbl);
 
     fprintf(out, "Usage: tee ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nRead from stdin and write to stdout and files simultaneously.\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-22s %s\n");
+    arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(argtable, 5);
+    arg_freetable(tbl, 5);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int tee_run(int argc, char **argv)
+int tee_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
     struct arg_lit  *help, *append, *json;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[6];
 
-    build_tee_argtable(&help, &append, &json, &files, &end, &argtable);
+    build_tee_argtable(&help, &append, &json, &files, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        tee_print_usage(stdout);
-        arg_freetable(argtable, 5);
+        tee_print_usage(out_stream);
+        arg_freetable(tbl, 5);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "tee");
         fprintf(stderr, "Try 'tee --help' for more information.\n");
-        arg_freetable(argtable, 5);
+        arg_freetable(tbl, 5);
         return 1;
     }
 
@@ -112,7 +109,7 @@ int tee_run(int argc, char **argv)
         fps = malloc(nfiles * sizeof(FILE *));
         if (!fps) {
             fprintf(stderr, "tee: out of memory\n");
-            arg_freetable(argtable, 5);
+            arg_freetable(tbl, 5);
             return 1;
         }
     }
@@ -127,7 +124,7 @@ int tee_run(int argc, char **argv)
         }
     }
 
-    /* Read all of stdin, write to stdout and all open files. */
+    /* Read all of in_stream, write to out_stream and all open files. */
     if (use_json) {
         /* Buffer everything, then emit JSON. */
         char   *buf  = NULL;
@@ -135,7 +132,7 @@ int tee_run(int argc, char **argv)
         char    tmp[4096];
         size_t  got;
 
-        while ((got = fread(tmp, 1, sizeof(tmp), stdin)) > 0) {
+        while ((got = fread(tmp, 1, sizeof(tmp), in_stream)) > 0) {
             if (size + got + 1 > cap) {
                 cap = (size + got + 1) * 2 + 4096;
                 buf = realloc(buf, cap);
@@ -152,17 +149,17 @@ int tee_run(int argc, char **argv)
                 if (fps[i]) fwrite(tmp, 1, got, fps[i]);
         }
 
-        printf("{\"bytes_read\": %zu, \"content\": \"", size);
-        if (buf) json_escape(stdout, buf, size);
-        printf("\"}\n");
+        fprintf(out_stream, "{\"bytes_read\": %zu, \"content\": \"", size);
+        if (buf) json_escape(out_stream, buf, size);
+        fprintf(out_stream, "\"}\n");
         free(buf);
 
     } else {
         char   buf[4096];
         size_t got;
 
-        while ((got = fread(buf, 1, sizeof(buf), stdin)) > 0) {
-            fwrite(buf, 1, got, stdout);
+        while ((got = fread(buf, 1, sizeof(buf), in_stream)) > 0) {
+            fwrite(buf, 1, got, out_stream);
             for (int i = 0; i < nfiles; i++)
                 if (fps[i]) fwrite(buf, 1, got, fps[i]);
         }
@@ -172,7 +169,7 @@ int tee_run(int argc, char **argv)
         if (fps[i]) fclose(fps[i]);
     free(fps);
 
-    arg_freetable(argtable, 5);
+    arg_freetable(tbl, 5);
     return ret;
 }
 

@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <pthread.h>
 
 #include "../include/cmd_spec.h"
 #include "tok.h"
@@ -158,134 +159,303 @@ static int apply_redirs(const stage_t *s)
     return 0;
 }
 
-/* ── run a single stage in-process (no pipe, registry command) ───────────── */
+/* ── per-thread argument packet ──────────────────────────────────────────── */
+
+typedef struct {
+    cmd_spec_t *spec;
+    int         argc;
+    char      **argv;        /* points into tok_t; valid while pipeline runs */
+    FILE       *in;
+    FILE       *out;
+    int         exit_code;
+} stage_arg_t;
+
+static void *stage_thread_fn(void *vp)
+{
+    stage_arg_t *a = vp;
+    a->exit_code = a->spec->run(a->argc, a->argv, a->in, a->out);
+    fclose(a->out);   /* flush and signal EOF to the downstream stage */
+    fclose(a->in);
+    return a;
+}
+
+/* ── run a single stage in-process (no pipe, no concurrency) ─────────────── */
 
 static int run_inproc(stage_t *s)
 {
-    /* Flush any buffered output from previous in-process commands before
-     * potentially redirecting stdout, so prior output lands in the right place. */
-    fflush(stdout);
-    fflush(stderr);
-
-    /* Save and redirect fds so the registered command sees the right streams. */
-    int saved_in  = -1, saved_out = -1;
-
-    if (s->redir_in) {
-        saved_in = dup(STDIN_FILENO);
-        int fd = open(s->redir_in, O_RDONLY);
-        if (fd < 0) {
-            fprintf(stderr, "mysh: %s: %s\n", s->redir_in, strerror(errno));
-            return 1;
-        }
-        dup2(fd, STDIN_FILENO); close(fd);
-        clearerr(stdin);   /* clear EOF flag left by any prior in-process stdin read */
-    }
-    if (s->redir_out) {
-        saved_out = dup(STDOUT_FILENO);
-        int flags = O_WRONLY | O_CREAT | (s->append ? O_APPEND : O_TRUNC);
-        int fd = open(s->redir_out, flags, 0644);
-        if (fd < 0) {
-            fprintf(stderr, "mysh: %s: %s\n", s->redir_out, strerror(errno));
-            if (saved_in >= 0) { dup2(saved_in, STDIN_FILENO); close(saved_in); }
-            return 1;
-        }
-        dup2(fd, STDOUT_FILENO); close(fd);
-    }
-
     cmd_spec_t *spec = reg_find(s->argv[0]);
-    int rc;
+
     if (spec) {
-        rc = spec->run(s->argc, s->argv);
-        fflush(stdout);
-        fflush(stderr);
+        /* Internal command: open any redirected files and pass explicit streams. */
+        FILE *in  = stdin;
+        FILE *out = stdout;
+        FILE *owned_in  = NULL;
+        FILE *owned_out = NULL;
+
+        if (s->redir_in) {
+            in = owned_in = fopen(s->redir_in, "r");
+            if (!in) {
+                fprintf(stderr, "mysh: %s: %s\n", s->redir_in, strerror(errno));
+                return 1;
+            }
+        }
+        if (s->redir_out) {
+            const char *mode = s->append ? "a" : "w";
+            out = owned_out = fopen(s->redir_out, mode);
+            if (!out) {
+                fprintf(stderr, "mysh: %s: %s\n", s->redir_out, strerror(errno));
+                if (owned_in) fclose(owned_in);
+                return 1;
+            }
+        }
+
+        int rc = spec->run(s->argc, s->argv, in, out);
+        fflush(out);
+        if (owned_out) fclose(owned_out);
+        if (owned_in)  fclose(owned_in);
+        return rc;
+
     } else {
         /* External command: fork so the child can exec without disturbing us. */
-        pid_t pid = fork();
-        if (pid < 0) { perror("fork"); rc = 1; }
-        else if (pid == 0) {
-            signal(SIGINT, SIG_DFL);
-            signal(SIGPIPE, SIG_DFL);
-            if (g_cmd_fd >= 0) close(g_cmd_fd);
-            execvp(s->argv[0], s->argv);
-            fprintf(stderr, "mysh: %s: %s\n", s->argv[0], strerror(errno));
-            _exit(127);
-        } else {
-            int status;
-            waitpid(pid, &status, 0);
-            rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-        }
-    }
-
-    if (saved_in  >= 0) { dup2(saved_in,  STDIN_FILENO);  close(saved_in);  }
-    if (saved_out >= 0) { dup2(saved_out, STDOUT_FILENO); close(saved_out); }
-    return rc;
-}
-
-/* ── run a full pipeline ─────────────────────────────────────────────────── */
-
-static int run_pipeline(stage_t *stages, int nstages)
-{
-    if (nstages == 1) return run_inproc(&stages[0]);
-
-    int     prev_rd = STDIN_FILENO;
-    pid_t   pids[PIPELINE_MAX];
-
-    for (int i = 0; i < nstages; i++) {
-        int wr_fd   = STDOUT_FILENO;
-        int next_rd = -1;
-
-        if (i < nstages - 1) {
-            int pfd[2];
-            if (pipe(pfd) < 0) { perror("pipe"); return 1; }
-            wr_fd   = pfd[1];
-            next_rd = pfd[0];
-        }
+        fflush(stdout);
+        fflush(stderr);
 
         pid_t pid = fork();
         if (pid < 0) { perror("fork"); return 1; }
 
         if (pid == 0) {
-            signal(SIGINT,  SIG_DFL);
+            signal(SIGINT, SIG_DFL);
             signal(SIGPIPE, SIG_DFL);
-
-            /* Close the dup'd command-reading fd so fd 0 is the only handle
-             * on the original stdin pipe and the child inherits a clean fd 0. */
             if (g_cmd_fd >= 0) close(g_cmd_fd);
-
-            if (prev_rd != STDIN_FILENO)  { dup2(prev_rd, STDIN_FILENO);  close(prev_rd);  }
-            if (wr_fd   != STDOUT_FILENO) { dup2(wr_fd,   STDOUT_FILENO); close(wr_fd);    }
-            if (next_rd >= 0) close(next_rd);
-
-            if (apply_redirs(&stages[i]) < 0) _exit(1);
-
-            cmd_spec_t *spec = reg_find(stages[i].argv[0]);
-            if (spec) {
-                int r = spec->run(stages[i].argc, stages[i].argv);
-                fflush(stdout);
-                fflush(stderr);
-                _exit(r);
-            }
-
-            execvp(stages[i].argv[0], stages[i].argv);
-            fprintf(stderr, "mysh: %s: %s\n", stages[i].argv[0], strerror(errno));
+            if (apply_redirs(s) < 0) _exit(1);
+            execvp(s->argv[0], s->argv);
+            fprintf(stderr, "mysh: %s: %s\n", s->argv[0], strerror(errno));
             _exit(127);
         }
 
-        pids[i] = pid;
-        if (prev_rd != STDIN_FILENO) close(prev_rd);
-        if (wr_fd   != STDOUT_FILENO) close(wr_fd);
-        prev_rd = next_rd;
+        int status;
+        waitpid(pid, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
+}
+
+/* ── run a full pipeline ─────────────────────────────────────────────────── */
+
+/*
+ * Per-stage tracking entry.  Exactly one of (is_thread, pid) is live after
+ * the stage has been successfully spawned.
+ */
+typedef struct {
+    int          is_thread;
+    pthread_t    tid;
+    stage_arg_t *arg;        /* heap-allocated; freed after pthread_join */
+    pid_t        pid;
+} spawn_t;
+
+static int run_pipeline(stage_t *stages, int nstages)
+{
+    if (nstages == 1) return run_inproc(&stages[0]);
+
+    spawn_t spawned[PIPELINE_MAX];
+    memset(spawned, 0, sizeof spawned);
+    int n_spawned = 0;
+
+    /*
+     * next_in_fd — the read end of the pipe that connects the stage we just
+     * set up to the one we are about to set up.  -1 means "no pending fd"
+     * (either we haven't created a pipe yet, or we broke out of the loop).
+     */
+    int next_in_fd = -1;
+
+    for (int i = 0; i < nstages; i++) {
+        stage_t    *s    = &stages[i];
+        cmd_spec_t *spec = reg_find(s->argv[0]);
+        int         last = (i == nstages - 1);
+
+        /* ── this stage's input fd ── */
+        int cur_in_fd;
+        if (i == 0) {
+            if (s->redir_in) {
+                cur_in_fd = open(s->redir_in, O_RDONLY);
+                if (cur_in_fd < 0) {
+                    fprintf(stderr, "mysh: %s: %s\n", s->redir_in, strerror(errno));
+                    break;
+                }
+                fcntl(cur_in_fd, F_SETFD, FD_CLOEXEC);
+            } else if (spec) {
+                /* Internal thread: dup stdin so fclose in the thread doesn't
+                 * close the shell's real fd 0. */
+                cur_in_fd = dup(STDIN_FILENO);
+                if (cur_in_fd < 0) { perror("dup"); break; }
+                fcntl(cur_in_fd, F_SETFD, FD_CLOEXEC);
+            } else {
+                cur_in_fd = STDIN_FILENO;  /* external: child gets fd 0 directly */
+            }
+        } else {
+            cur_in_fd  = next_in_fd;   /* read end left over from previous pipe */
+            next_in_fd = -1;
+        }
+
+        /* ── this stage's output fd; also creates next stage's input fd ── */
+        int cur_out_fd;
+
+        if (!last) {
+            /*
+             * Create the inter-stage pipe.  O_CLOEXEC ensures that any
+             * fork'd external-command child exec's with these fds closed,
+             * preventing it from holding a write end open and blocking EOF.
+             */
+            int pfd[2];
+            if (pipe(pfd) < 0) {
+                perror("pipe");
+                if (cur_in_fd != STDIN_FILENO) close(cur_in_fd);
+                break;
+            }
+            fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+            fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+            cur_out_fd = pfd[1];
+            next_in_fd = pfd[0];
+        } else {
+            /* Last stage: honour output redirection or dup stdout. */
+            if (s->redir_out) {
+                int flags = O_WRONLY | O_CREAT | (s->append ? O_APPEND : O_TRUNC);
+                cur_out_fd = open(s->redir_out, flags, 0644);
+                if (cur_out_fd < 0) {
+                    fprintf(stderr, "mysh: %s: %s\n", s->redir_out, strerror(errno));
+                    if (cur_in_fd != STDIN_FILENO) close(cur_in_fd);
+                    break;
+                }
+                fcntl(cur_out_fd, F_SETFD, FD_CLOEXEC);
+            } else if (spec) {
+                /* Internal thread: dup stdout so fclose doesn't close fd 1. */
+                cur_out_fd = dup(STDOUT_FILENO);
+                if (cur_out_fd < 0) {
+                    perror("dup");
+                    if (cur_in_fd != STDIN_FILENO) close(cur_in_fd);
+                    break;
+                }
+                fcntl(cur_out_fd, F_SETFD, FD_CLOEXEC);
+            } else {
+                cur_out_fd = STDOUT_FILENO;
+            }
+        }
+
+        /* ── spawn the stage ── */
+        if (spec) {
+            /*
+             * Internal command — run inside a worker thread.
+             * fdopen() takes ownership of the fds: the thread closes them via
+             * fclose() when it finishes, which signals EOF to the next stage.
+             */
+            stage_arg_t *a = malloc(sizeof *a);
+            if (!a) {
+                perror("malloc");
+                if (cur_in_fd  != STDIN_FILENO)  close(cur_in_fd);
+                if (cur_out_fd != STDOUT_FILENO) close(cur_out_fd);
+                break;
+            }
+            a->spec      = spec;
+            a->argc      = s->argc;
+            a->argv      = s->argv;
+            a->exit_code = 0;
+
+            a->in = fdopen(cur_in_fd, "r");
+            if (!a->in) {
+                perror("fdopen");
+                close(cur_in_fd);
+                if (cur_out_fd != STDOUT_FILENO) close(cur_out_fd);
+                free(a);
+                break;
+            }
+            a->out = fdopen(cur_out_fd, "w");
+            if (!a->out) {
+                perror("fdopen");
+                fclose(a->in);          /* also closes cur_in_fd */
+                close(cur_out_fd);
+                free(a);
+                break;
+            }
+
+            spawned[i].is_thread = 1;
+            spawned[i].arg       = a;
+            if (pthread_create(&spawned[i].tid, NULL, stage_thread_fn, a) != 0) {
+                perror("pthread_create");
+                fclose(a->in);
+                fclose(a->out);
+                free(a);
+                spawned[i].is_thread = 0;
+                break;
+            }
+            n_spawned++;
+
+        } else {
+            /*
+             * External command — fork and exec.
+             * All pipe fds carry FD_CLOEXEC so exec() closes them in the
+             * child automatically; we only dup2 the ones this stage owns.
+             */
+            fflush(stdout);
+            fflush(stderr);
+
+            pid_t pid = fork();
+            if (pid < 0) {
+                perror("fork");
+                if (cur_in_fd  != STDIN_FILENO)  close(cur_in_fd);
+                if (cur_out_fd != STDOUT_FILENO) close(cur_out_fd);
+                break;
+            }
+
+            if (pid == 0) {
+                signal(SIGINT,  SIG_DFL);
+                signal(SIGPIPE, SIG_DFL);
+                if (g_cmd_fd >= 0) close(g_cmd_fd);
+
+                /* dup2 lands the fds on 0/1; the originals close with the
+                 * FD_CLOEXEC copies on exec, leaving a clean fd table. */
+                if (cur_in_fd  != STDIN_FILENO)
+                    { dup2(cur_in_fd,  STDIN_FILENO);  close(cur_in_fd); }
+                if (cur_out_fd != STDOUT_FILENO)
+                    { dup2(cur_out_fd, STDOUT_FILENO); close(cur_out_fd); }
+
+                execvp(s->argv[0], s->argv);
+                fprintf(stderr, "mysh: %s: %s\n", s->argv[0], strerror(errno));
+                _exit(127);
+            }
+
+            /* Parent: release fds now that the child has them. */
+            if (cur_in_fd  != STDIN_FILENO)  close(cur_in_fd);
+            if (cur_out_fd != STDOUT_FILENO) close(cur_out_fd);
+
+            spawned[i].pid = pid;
+            n_spawned++;
+        }
     }
 
-    /* Wait for all stages; return exit status of the last one. */
-    int last = 0;
-    for (int i = 0; i < nstages; i++) {
-        int status;
-        waitpid(pids[i], &status, 0);
-        if (i == nstages - 1)
-            last = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    /* If we broke out of the loop early, discard the dangling read-end fd. */
+    if (next_in_fd >= 0) close(next_in_fd);
+
+    /*
+     * Collect results.  Join all threads (including intermediate ones) before
+     * reaping processes, so that thread-generated writes reach downstream
+     * readers before we declare the pipeline done.
+     *
+     * pthread_join on the final thread gives us the terminal exit status.
+     */
+    int last_rc = 1;
+    for (int i = 0; i < n_spawned; i++) {
+        if (spawned[i].is_thread) {
+            pthread_join(spawned[i].tid, NULL);
+            int rc = spawned[i].arg->exit_code;
+            free(spawned[i].arg);
+            if (i == n_spawned - 1) last_rc = rc;
+        } else {
+            int status;
+            waitpid(spawned[i].pid, &status, 0);
+            int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+            if (i == n_spawned - 1) last_rc = rc;
+        }
     }
-    return last;
+    return last_rc;
 }
 
 /* ── built-in: help ──────────────────────────────────────────────────────── */

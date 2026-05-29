@@ -15,7 +15,7 @@ static void build_echo_argtable(
     struct arg_lit  **json,
     struct arg_str  **words,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 7 slots */
 {
     *help       = arg_lit0("h", "help",       "show this help and exit");
     *no_newline = arg_lit0("n", NULL,          "do not output trailing newline");
@@ -24,7 +24,6 @@ static void build_echo_argtable(
     *words      = arg_strn(NULL, NULL, "[STRING...]", 0, 64, "strings to echo");
     *end        = arg_end(20);
 
-    static void *tbl[7];
     tbl[0] = *help;
     tbl[1] = *no_newline;
     tbl[2] = *escape;
@@ -32,8 +31,6 @@ static void build_echo_argtable(
     tbl[4] = *words;
     tbl[5] = *end;
     tbl[6] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -55,25 +52,25 @@ static void json_escape(FILE *out, const char *s)
 }
 
 /* Write a string interpreting \n, \t, \r, \\, \0, \a, \b, \f, \v escapes. */
-static void print_escaped(const char *s)
+static void print_escaped(FILE *out, const char *s)
 {
     for (; *s; s++) {
         if (*s == '\\' && s[1]) {
             s++;
             switch (*s) {
-            case 'n':  putchar('\n'); break;
-            case 't':  putchar('\t'); break;
-            case 'r':  putchar('\r'); break;
-            case '\\': putchar('\\'); break;
-            case '0':  putchar('\0'); break;
-            case 'a':  putchar('\a'); break;
-            case 'b':  putchar('\b'); break;
-            case 'f':  putchar('\f'); break;
-            case 'v':  putchar('\v'); break;
-            default:   putchar('\\'); putchar(*s); break;
+            case 'n':  fputc('\n', out); break;
+            case 't':  fputc('\t', out); break;
+            case 'r':  fputc('\r', out); break;
+            case '\\': fputc('\\', out); break;
+            case '0':  fputc('\0', out); break;
+            case 'a':  fputc('\a', out); break;
+            case 'b':  fputc('\b', out); break;
+            case 'f':  fputc('\f', out); break;
+            case 'v':  fputc('\v', out); break;
+            default:   fputc('\\', out); fputc(*s, out); break;
             }
         } else {
-            putchar(*s);
+            fputc(*s, out);
         }
     }
 }
@@ -87,42 +84,44 @@ void echo_print_usage(FILE *out)
     struct arg_lit *help, *no_newline, *escape, *json;
     struct arg_str *words;
     struct arg_end *end;
-    void          **argtable;
+    void           *tbl[7];
 
-    build_echo_argtable(&help, &no_newline, &escape, &json, &words, &end, &argtable);
+    build_echo_argtable(&help, &no_newline, &escape, &json, &words, &end, tbl);
 
     fprintf(out, "Usage: echo ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nEcho the STRING(s) to standard output.\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-22s %s\n");
+    arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(argtable, 6);
+    arg_freetable(tbl, 6);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int echo_run(int argc, char **argv)
+int echo_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
+    (void)in_stream;   /* echo never reads input */
+
     struct arg_lit *help, *no_newline, *escape, *json;
     struct arg_str *words;
     struct arg_end *end;
-    void          **argtable;
+    void           *tbl[7];
 
-    build_echo_argtable(&help, &no_newline, &escape, &json, &words, &end, &argtable);
+    build_echo_argtable(&help, &no_newline, &escape, &json, &words, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        echo_print_usage(stdout);
-        arg_freetable(argtable, 6);
+        echo_print_usage(out_stream);
+        arg_freetable(tbl, 6);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "echo");
         fprintf(stderr, "Try 'echo --help' for more information.\n");
-        arg_freetable(argtable, 6);
+        arg_freetable(tbl, 6);
         return 1;
     }
 
@@ -132,25 +131,25 @@ int echo_run(int argc, char **argv)
     int nwords         = words->count;
 
     if (use_json) {
-        printf("{\"output\": \"");
+        fprintf(out_stream, "{\"output\": \"");
         for (int i = 0; i < nwords; i++) {
-            if (i > 0) putchar(' ');
-            json_escape(stdout, words->sval[i]);
+            if (i > 0) fputc(' ', out_stream);
+            json_escape(out_stream, words->sval[i]);
         }
-        if (!use_no_newline) fputs("\\n", stdout);
-        printf("\"}\n");
+        if (!use_no_newline) fputs("\\n", out_stream);
+        fprintf(out_stream, "\"}\n");
     } else {
         for (int i = 0; i < nwords; i++) {
-            if (i > 0) putchar(' ');
+            if (i > 0) fputc(' ', out_stream);
             if (use_escape)
-                print_escaped(words->sval[i]);
+                print_escaped(out_stream, words->sval[i]);
             else
-                fputs(words->sval[i], stdout);
+                fputs(words->sval[i], out_stream);
         }
-        if (!use_no_newline) putchar('\n');
+        if (!use_no_newline) fputc('\n', out_stream);
     }
 
-    arg_freetable(argtable, 6);
+    arg_freetable(tbl, 6);
     return 0;
 }
 

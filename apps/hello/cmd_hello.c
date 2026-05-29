@@ -11,19 +11,16 @@ static void build_hello_argtable(
     struct arg_lit  **help,
     struct arg_str  **name,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 4 slots */
 {
     *help = arg_lit0("h", "help", "show this help and exit");
     *name = arg_str0("n", "name", "NAME", "whom to greet (default: World)");
     *end  = arg_end(20);
 
-    static void *tbl[4];
     tbl[0] = *help;
     tbl[1] = *name;
     tbl[2] = *end;
     tbl[3] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -35,50 +32,52 @@ void hello_print_usage(FILE *out)
     struct arg_lit  *help;
     struct arg_str  *name;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[4];
 
-    build_hello_argtable(&help, &name, &end, &argtable);
+    build_hello_argtable(&help, &name, &end, tbl);
 
     fprintf(out, "Usage: hello ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nPrint a friendly greeting.\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-22s %s\n");
+    arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(argtable, 3);
+    arg_freetable(tbl, 3);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int hello_run(int argc, char **argv)
+int hello_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
+    (void)in_stream;   /* hello never reads input */
+
     struct arg_lit  *help;
     struct arg_str  *name;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[4];
 
-    build_hello_argtable(&help, &name, &end, &argtable);
+    build_hello_argtable(&help, &name, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        hello_print_usage(stdout);
-        arg_freetable(argtable, 3);
+        hello_print_usage(out_stream);
+        arg_freetable(tbl, 3);
         return 0;
     }
 
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "hello");
         fprintf(stderr, "Try 'hello --help' for more information.\n");
-        arg_freetable(argtable, 3);
+        arg_freetable(tbl, 3);
         return 1;
     }
 
     const char *whom = (name->count > 0) ? name->sval[0] : "World";
-    printf("Hello, %s!\n", whom);
+    fprintf(out_stream, "Hello, %s!\n", whom);
 
-    arg_freetable(argtable, 3);
+    arg_freetable(tbl, 3);
     return 0;
 }
 

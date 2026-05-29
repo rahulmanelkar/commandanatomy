@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -D_GNU_SOURCE -I../include
-LDFLAGS = -lm
+LDFLAGS = -lm -lpthread
 
 ARGTABLE_DIR = ../vendor/argtable3
 ARGTABLE_INC = -I$(ARGTABLE_DIR)

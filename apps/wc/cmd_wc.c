@@ -18,7 +18,7 @@ static void build_wc_argtable(
     struct arg_lit  **json,
     struct arg_file **files,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 9 slots */
 {
     *help  = arg_lit0("h", "help",  "show this help and exit");
     *lines = arg_lit0("l", "lines", "print newline count");
@@ -29,7 +29,6 @@ static void build_wc_argtable(
     *files = arg_filen(NULL, NULL, "[FILE...]", 0, 64, "files to count (default: stdin)");
     *end   = arg_end(20);
 
-    static void *tbl[9];
     tbl[0] = *help;
     tbl[1] = *lines;
     tbl[2] = *words;
@@ -39,8 +38,6 @@ static void build_wc_argtable(
     tbl[6] = *files;
     tbl[7] = *end;
     tbl[8] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -80,31 +77,31 @@ static counts_t count_stream(FILE *fp)
  * output
  * -------------------------------------------------------------------------- */
 
-static void print_plain_row(counts_t c, int show_l, int show_w, int show_b,
+static void print_plain_row(FILE *out, counts_t c, int show_l, int show_w, int show_b,
                              int show_m, const char *label)
 {
-    if (show_l) printf(" %7lld", c.lines);
-    if (show_w) printf(" %7lld", c.words);
-    if (show_b) printf(" %7lld", c.bytes);
-    if (show_m) printf(" %7lld", c.chars);
-    if (label)  printf(" %s", label);
-    printf("\n");
+    if (show_l) fprintf(out, " %7lld", c.lines);
+    if (show_w) fprintf(out, " %7lld", c.words);
+    if (show_b) fprintf(out, " %7lld", c.bytes);
+    if (show_m) fprintf(out, " %7lld", c.chars);
+    if (label)  fprintf(out, " %s", label);
+    fprintf(out, "\n");
 }
 
-static void print_json_row(counts_t c, int show_l, int show_w, int show_b,
+static void print_json_row(FILE *out, counts_t c, int show_l, int show_w, int show_b,
                             int show_m, const char *label, int trailing_comma)
 {
-    printf("  {");
-    if (label) printf("\"file\": \"%s\", ", label);
+    fprintf(out, "  {");
+    if (label) fprintf(out, "\"file\": \"%s\", ", label);
     int first = 1;
 #define FIELD(flag, key, val) \
-    if (flag) { if (!first) printf(", "); printf("\"" key "\": %lld", val); first = 0; }
+    if (flag) { if (!first) fprintf(out, ", "); fprintf(out, "\"" key "\": %lld", val); first = 0; }
     FIELD(show_l, "lines", c.lines)
     FIELD(show_w, "words", c.words)
     FIELD(show_b, "bytes", c.bytes)
     FIELD(show_m, "chars", c.chars)
 #undef FIELD
-    printf("}%s\n", trailing_comma ? "," : "");
+    fprintf(out, "}%s\n", trailing_comma ? "," : "");
 }
 
 /* --------------------------------------------------------------------------
@@ -116,44 +113,44 @@ void wc_print_usage(FILE *out)
     struct arg_lit  *help, *lines, *words, *bytes, *chars, *json;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[9];
 
-    build_wc_argtable(&help, &lines, &words, &bytes, &chars, &json, &files, &end, &argtable);
+    build_wc_argtable(&help, &lines, &words, &bytes, &chars, &json, &files, &end, tbl);
 
     fprintf(out, "Usage: wc ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nCount lines, words, and bytes in files.\n"
                  "With no mode flags, defaults to -lwc (lines, words, bytes).\n\n"
                  "Options:\n");
-    arg_print_glossary(out, argtable, "  %-22s %s\n");
+    arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(argtable, 8);
+    arg_freetable(tbl, 8);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int wc_run(int argc, char **argv)
+int wc_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
     struct arg_lit  *help, *lines, *words, *bytes, *chars, *json;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[9];
 
-    build_wc_argtable(&help, &lines, &words, &bytes, &chars, &json, &files, &end, &argtable);
+    build_wc_argtable(&help, &lines, &words, &bytes, &chars, &json, &files, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        wc_print_usage(stdout);
-        arg_freetable(argtable, 8);
+        wc_print_usage(out_stream);
+        arg_freetable(tbl, 8);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "wc");
         fprintf(stderr, "Try 'wc --help' for more information.\n");
-        arg_freetable(argtable, 8);
+        arg_freetable(tbl, 8);
         return 1;
     }
 
@@ -171,15 +168,14 @@ int wc_run(int argc, char **argv)
     int nfiles = files->count;
     int ret = 0;
 
-    if (use_json) printf("[\n");
+    if (use_json) fprintf(out_stream, "[\n");
 
     if (nfiles == 0) {
-        /* Read stdin. */
-        counts_t c = count_stream(stdin);
+        counts_t c = count_stream(in_stream);
         if (use_json)
-            print_json_row(c, show_l, show_w, show_b, show_m, NULL, 0);
+            print_json_row(out_stream, c, show_l, show_w, show_b, show_m, NULL, 0);
         else
-            print_plain_row(c, show_l, show_w, show_b, show_m, NULL);
+            print_plain_row(out_stream, c, show_l, show_w, show_b, show_m, NULL);
     } else {
         counts_t total = {0, 0, 0, 0};
 
@@ -201,23 +197,23 @@ int wc_run(int argc, char **argv)
 
             int more = (nfiles > 1) && (i + 1 < nfiles);
             if (use_json)
-                print_json_row(c, show_l, show_w, show_b, show_m, path,
+                print_json_row(out_stream, c, show_l, show_w, show_b, show_m, path,
                                more || nfiles > 1);
             else
-                print_plain_row(c, show_l, show_w, show_b, show_m, path);
+                print_plain_row(out_stream, c, show_l, show_w, show_b, show_m, path);
         }
 
         if (nfiles > 1) {
             if (use_json)
-                print_json_row(total, show_l, show_w, show_b, show_m, "total", 0);
+                print_json_row(out_stream, total, show_l, show_w, show_b, show_m, "total", 0);
             else
-                print_plain_row(total, show_l, show_w, show_b, show_m, "total");
+                print_plain_row(out_stream, total, show_l, show_w, show_b, show_m, "total");
         }
     }
 
-    if (use_json) printf("]\n");
+    if (use_json) fprintf(out_stream, "]\n");
 
-    arg_freetable(argtable, 8);
+    arg_freetable(tbl, 8);
     return ret;
 }
 

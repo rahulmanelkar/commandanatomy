@@ -51,7 +51,7 @@ typedef struct cmd_spec {
     const char *name;
     const char *summary;
     const char *long_help;
-    int  (*run)(int argc, char **argv);
+    int  (*run)(int argc, char **argv, FILE *in_stream, FILE *out_stream);
     void (*print_usage)(FILE *out);
 } cmd_spec_t;
 ```
@@ -60,7 +60,7 @@ Every command module defines exactly one global instance of this struct. It is t
 
 ### The argtable3 builder pattern
 
-Each `cmd_<name>.c` contains a single static function `build_<name>_argtable()` that allocates all argtable3 argument objects and fills a `void *` table. Both `run()` and `print_usage()` call this same builder, so the CLI definition is never duplicated:
+Each `cmd_<name>.c` contains a single static function `build_<name>_argtable()` that allocates all argtable3 argument objects and fills a caller-supplied `void *` table. Both `run()` and `print_usage()` call this same builder, so the CLI definition is never duplicated:
 
 ```c
 static void build_cat_argtable(
@@ -70,7 +70,7 @@ static void build_cat_argtable(
     struct arg_lit  **json,
     struct arg_file **files,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)          /* caller allocates: void *tbl[7] */
 {
     *help      = arg_lit0("h", "help",      "show this help and exit");
     *number    = arg_lit0("n", "number",    "number all output lines");
@@ -79,14 +79,12 @@ static void build_cat_argtable(
     *files     = arg_filen(NULL, NULL, "[FILE...]", 0, 64, "files to concatenate");
     *end       = arg_end(20);
 
-    static void *tbl[7];
     tbl[0] = *help; tbl[1] = *number; tbl[2] = *show_ends;
     tbl[3] = *json; tbl[4] = *files;  tbl[5] = *end; tbl[6] = NULL;
-    *argtable_out = tbl;
 }
 ```
 
-**Why a static table?** argtable3 requires a `void **` array terminated by a NULL sentinel. Declaring it `static` inside the builder avoids heap allocation while keeping the pointer valid for the lifetime of the argtable. Only one invocation of the builder is live at a time (single-threaded), so the static is safe.
+The caller declares `void *tbl[N]` on its own stack frame and passes it in. This makes the builder thread-safe: each concurrent invocation operates on its own stack-local table with no shared mutable state. The table is valid for the duration of the calling function and is freed via `arg_freetable(tbl, N)` before every return path.
 
 `print_usage` calls the builder, calls `arg_print_syntax` and `arg_print_glossary`, then frees. `run` calls the builder, parses, dispatches, then frees. The argtable is always freed before returning, even on error paths.
 
@@ -106,7 +104,7 @@ The main entry point (`<name>_main.c`) is always two lines:
 
 ```c
 int main(int argc, char **argv) {
-    return cmd_<name>_spec.run(argc, argv);
+    return cmd_<name>_spec.run(argc, argv, stdin, stdout);
 }
 ```
 
@@ -161,7 +159,7 @@ APP_OBJS = ../apps/cat/cmd_cat.o \
            ...
 
 mysh: mysh.o tok.o argtable3.o $(APP_OBJS)
-    $(CC) -o $@ $^ -lm
+    $(CC) -o $@ $^ -lm -lpthread
 ```
 
 **Why link `.o` instead of `.a`?** If the shell linked multiple `.a` files, each would carry its own copy of `argtable3.o`, causing duplicate symbol errors at link time. Linking the `cmd_*.o` files directly with a single shared `argtable3.o` avoids this entirely.
@@ -221,34 +219,50 @@ typedef struct {
 
 For a single command with no pipe, `run_inproc` is called:
 
-1. Flush stdout/stderr to prevent buffered output from landing in the wrong file if redirection is about to happen.
-2. If `redir_in` or `redir_out` is set, `dup` the original fd, `open` the file, `dup2` it to fd 0 or 1. The saved fd is restored after the command returns.
-3. Look up the command in the registry with `reg_find`. If found, call `spec->run()` directly — no fork, no exec.
-4. If not in registry, `fork` + `execvp`. The parent `waitpid`s.
-5. Restore saved fds.
+1. Look up the command in the registry with `reg_find`.
+2. If found, resolve file redirections by `fopen`ing the named files into local `FILE *in` / `FILE *out` variables (falling back to `stdin`/`stdout` when no redirection is specified), then call `spec->run(argc, argv, in, out)` directly — no fork, no exec, no `dup2`.
+3. If not in registry, `fork` + `execvp` with `dup2`-based redirection in the child. The parent `waitpid`s.
 
 The in-process path is the key performance feature: `ls`, `cat`, `grep`, `sort`, etc. run without spawning a process.
 
 **Multi-stage pipeline — `run_pipeline`:**
 
-For two or more stages, every stage runs in a forked child:
+For two or more stages, internal (registered) commands run as POSIX threads; external commands still fork:
 
 ```
-stage[0] --> pipe[0] --> stage[1] --> pipe[1] --> stage[2] --> stdout
+stage[0]──thread──┐pipe[0]┌──thread──stage[1]──┐pipe[1]┌──thread──stage[2]
+                  └───────┘                     └───────┘
 ```
 
-Each child:
-1. Closes `g_cmd_fd` (the fd holding the shell's script/stdin) so the child doesn't accidentally inherit command text in fd 0.
-2. `dup2`s `prev_rd` to stdin and `wr_fd` to stdout.
-3. Closes unused pipe ends.
-4. Applies file redirections on top.
-5. Looks up the registry; if found, calls `spec->run()` then `_exit`. If not, `execvp`.
+For each stage in order:
 
-The parent closes each pipe end as it advances through the stages, then `waitpid`s all children and returns the exit status of the last stage.
+1. Create a Unix pipe with `pipe()`. Both ends are immediately marked `FD_CLOEXEC` so they are not inherited by any `fork`'d external-command child in the same pipeline.
+2. Determine the input source for this stage:
+   - If it is the first stage and there is a `redir_in`, `fopen` that file; otherwise `fdopen(dup(STDIN_FILENO), "r")` to get a `FILE*` the thread can safely `fclose` without closing the shell's real fd 0.
+   - Otherwise `fdopen` the read end of the previous stage's pipe.
+3. Determine the output sink:
+   - If it is the last stage and there is a `redir_out`, `fopen` that file; otherwise `fdopen(dup(STDOUT_FILENO), "w")` for the same reason.
+   - Otherwise `fdopen` the write end of the new pipe.
+4. **Internal command:** allocate a `stage_arg_t` on the heap:
+   ```c
+   typedef struct {
+       cmd_spec_t *spec;
+       int         argc;
+       char      **argv;
+       FILE       *in;
+       FILE       *out;
+       int         exit_code;
+   } stage_arg_t;
+   ```
+   Spawn a thread with `pthread_create` running `stage_thread_fn`, which calls `spec->run(argc, argv, in, out)`, then `fclose(out)` and `fclose(in)`. Closing `out` signals EOF to the downstream reader. Store the `pthread_t` and `stage_arg_t *` in a `spawn_t` record (`is_thread = 1`).
+5. **External command:** `fork`. The child clears `FD_CLOEXEC` on the assigned pipe fds, `dup2`s them to fd 0/1, closes all pipe ends, closes `g_cmd_fd`, and `execvp`s. The parent closes the raw pipe fds it just handed to the child and stores the `pid_t` in a `spawn_t` record (`is_thread = 0`).
 
-**Why fork even registered commands in pipelines?**
+After all stages are spawned, the shell collects results:
+- `pthread_join` for every thread spawn; the `stage_arg_t.exit_code` field holds the return value of `run()`.
+- `waitpid` for every process spawn.
+- The exit status of the last stage is returned as the pipeline result.
 
-Registered commands read from stdin and write to stdout. In a pipeline, stdin/stdout must be wired to pipes. Doing this in-process would require saving and restoring fd 0/1, and — critically — any buffered I/O state (`FILE *stdin`) would be corrupted for the next command. Forking gives each stage an isolated fd namespace at the cost of one extra process per stage.
+`FD_CLOEXEC` on all pipe fds ensures that no forked external-command child accidentally holds a write end of an inter-thread pipe open (which would prevent EOF from being delivered to the downstream thread).
 
 ### `g_cmd_fd` — the stdin contamination fix
 
@@ -319,7 +333,7 @@ Compiles `PATTERN` as a POSIX extended regular expression with `regcomp(REG_EXTE
 
 ### `sort` — sort lines
 
-Reads all lines from all inputs into a single heap-allocated `char **` array, then calls `qsort` with a custom comparator. Comparator state is held in four module-level globals (`g_reverse`, `g_numeric`, `g_key`, `g_sep`) — safe because `qsort` is single-threaded. Field extraction for `-k` splits on whitespace (default) or on the `-t` separator character.
+Reads all lines from all inputs into a single heap-allocated `char **` array, then calls `qsort_r` with a custom comparator. Comparator options (`reverse`, `numeric`, `key`, `sep`) are held in a `sort_ctx_t` struct on `sort_run`'s stack and passed through `qsort_r`'s context pointer, so concurrent invocations never share state. Field extraction for `-k` splits on whitespace (default) or on the `-t` separator character.
 
 `-u` (unique): after sorting, a second pass marks adjacent equal lines `NULL` (freeing the string); the output pass skips NULLs. This avoids an auxiliary data structure.
 
@@ -359,9 +373,17 @@ Every app builds to both `<name>` (standalone binary) and `lib<name>.a` (static 
 
 ### In-process execution for registered commands
 
-Registered commands run in-process for single-stage invocations: no `fork`, no `exec`, no process creation overhead. For a shell used interactively with many short commands, this is a meaningful latency improvement. The tradeoff is that a misbehaving command (segfault, infinite loop) crashes the shell — acceptable in a course/educational context.
+Registered commands run in-process for both single-stage and multi-stage invocations: no `fork`, no `exec`. For single-stage commands this means no process creation at all. For pipelines it means threads instead of forks — significantly cheaper, and it enables true concurrent data flow where stages overlap in time rather than running sequentially.
 
-In pipelines, every stage forks regardless, because pipes require fd rewiring that cannot be safely done in-process with `FILE *`-based I/O.
+The tradeoff is that a misbehaving command (segfault, infinite loop) crashes or hangs the shell — acceptable in a course/educational context.
+
+The critical enabler for in-process pipelines is the explicit `FILE *in_stream, FILE *out_stream` signature on every `run()` function. Because streams are passed as parameters, no shared fd state (fd 0/1) needs to be mutated, so multiple threads can run concurrently without any `dup2` or fd save/restore.
+
+### Thread-safety of argtable3 builder
+
+The stack-allocated `void *tbl[N]` pattern makes each builder invocation operate on its own stack frame. Multiple concurrent calls to the same builder are safe because no static or global data is shared.
+
+`sort` uses `qsort_r` (GNU extension, available via `_GNU_SOURCE`) rather than `qsort`. `qsort_r` accepts a `void *` context pointer and forwards it to every comparator call, so all comparator options live in a stack-local `sort_ctx_t` struct. Two concurrent `sort` stages in the same pipeline are fully independent.
 
 ### stdin contamination fix (`g_cmd_fd`)
 
@@ -381,3 +403,36 @@ The shell uses `_POSIX_C_SOURCE 200809L` for `getline`, `dprintf`, and other POS
 | `MAX_POSITIONS` | 4096 | Max field/char index in `cut` |
 
 These are generous enough for all real use cases and avoid the complexity of dynamic resizing in the shell's hot path.
+
+---
+
+## Testing
+
+### `test_apps.sh`
+
+A Bash test runner at the repo root covers all apps and the shell's pipeline executor:
+
+```sh
+./test_apps.sh                    # run all 36 tests
+./test_apps.sh --test N           # run a specific test by number
+./test_apps.sh --test N --test M  # run multiple specific tests
+```
+
+The runner has two execution modes:
+
+- **`run_test`** — invokes a binary directly, captures stdout+stderr, checks exit code, and optionally compares against an exact expected string.
+- **`run_mysh`** — writes a pipeline string to a temp script file and runs it through `mysh`. Displays the pipeline string (not the script path) so the log is readable.
+
+Exit code is 0 if all selected tests pass, 1 otherwise — suitable for use in a CI script.
+
+### Thread-safety verification
+
+Tests 33–35 directly exercise the `qsort_r` fix for `sort`. Each test runs a pipeline containing two concurrent `sort` threads and checks that the output is correct:
+
+| Test | Pipeline | What it verifies |
+|---|---|---|
+| 33 | `cat \| sort \| uniq -c \| sort -rn` | Two sort threads with different flags don't race on comparator state |
+| 34 | `cat \| grep \| sort \| uniq -c \| sort -rn` | Same, with grep adding a third concurrent thread |
+| 35 | `cat \| grep \| sort \| uniq -c \| sort -rn \| head -n 3` | Pipeline terminates correctly when `head` closes its input pipe early |
+
+Before the `qsort_r` fix, test 33 produced wrong output (all counts showed as 1) because the second `sort -rn` thread wrote `g_numeric=1` into the module-level global before the first `sort` thread called `qsort`, causing it to treat `#include`-style strings as numeric values (all comparing as 0, no reordering, so `uniq` saw no adjacent duplicates). The fix moved all comparator state into a `sort_ctx_t` struct passed through `qsort_r`'s context pointer, eliminating the shared mutable state entirely.

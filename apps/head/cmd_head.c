@@ -16,7 +16,7 @@ static void build_head_argtable(
     struct arg_lit  **json,
     struct arg_file **files,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 7 slots */
 {
     *help  = arg_lit0("h", "help",  "show this help and exit");
     *lines = arg_int0("n", "lines", "NUM", "print first NUM lines instead of 10");
@@ -25,7 +25,6 @@ static void build_head_argtable(
     *files = arg_filen(NULL, NULL, "[FILE...]", 0, 64, "files to read (default: stdin)");
     *end   = arg_end(20);
 
-    static void *tbl[7];
     tbl[0] = *help;
     tbl[1] = *lines;
     tbl[2] = *bytes;
@@ -33,8 +32,6 @@ static void build_head_argtable(
     tbl[4] = *files;
     tbl[5] = *end;
     tbl[6] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -55,7 +52,7 @@ static void json_escape(FILE *out, const char *s, size_t len)
     }
 }
 
-static int head_lines(FILE *fp, int n)
+static int head_lines(FILE *fp, FILE *out, int n)
 {
     char   *line = NULL;
     size_t  cap  = 0;
@@ -63,7 +60,7 @@ static int head_lines(FILE *fp, int n)
     int     count = 0;
 
     while (count < n && (len = getline(&line, &cap, fp)) != -1) {
-        fwrite(line, 1, len, stdout);
+        fwrite(line, 1, len, out);
         count++;
     }
 
@@ -71,7 +68,7 @@ static int head_lines(FILE *fp, int n)
     return ferror(fp) ? 1 : 0;
 }
 
-static int head_bytes(FILE *fp, int n)
+static int head_bytes(FILE *fp, FILE *out, int n)
 {
     char buf[4096];
     int  remaining = n;
@@ -80,14 +77,14 @@ static int head_bytes(FILE *fp, int n)
         int    want = remaining < (int)sizeof(buf) ? remaining : (int)sizeof(buf);
         size_t got  = fread(buf, 1, want, fp);
         if (got == 0) break;
-        fwrite(buf, 1, got, stdout);
+        fwrite(buf, 1, got, out);
         remaining -= (int)got;
     }
 
     return ferror(fp) ? 1 : 0;
 }
 
-static int head_json(FILE *fp, const char *label, int n_lines, int is_last)
+static int head_json(FILE *fp, FILE *out, const char *label, int n_lines, int is_last)
 {
     char   *line = NULL;
     size_t  cap  = 0;
@@ -115,15 +112,15 @@ static int head_json(FILE *fp, const char *label, int n_lines, int is_last)
 
     int err = ferror(fp);
 
-    printf("  {");
+    fprintf(out, "  {");
     if (label) {
-        printf("\"file\": \"");
-        json_escape(stdout, label, strlen(label));
-        printf("\", ");
+        fprintf(out, "\"file\": \"");
+        json_escape(out, label, strlen(label));
+        fprintf(out, "\", ");
     }
-    printf("\"content\": \"");
-    if (buf) json_escape(stdout, buf, total);
-    printf("\"}%s\n", is_last ? "" : ",");
+    fprintf(out, "\"content\": \"");
+    if (buf) json_escape(out, buf, total);
+    fprintf(out, "\"}%s\n", is_last ? "" : ",");
 
     free(buf);
     return err ? 1 : 0;
@@ -139,43 +136,43 @@ void head_print_usage(FILE *out)
     struct arg_int  *lines, *bytes;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[7];
 
-    build_head_argtable(&help, &lines, &bytes, &json, &files, &end, &argtable);
+    build_head_argtable(&help, &lines, &bytes, &json, &files, &end, tbl);
 
     fprintf(out, "Usage: head ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nPrint the first lines of each FILE to standard output.\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-22s %s\n");
+    arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(argtable, 6);
+    arg_freetable(tbl, 6);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int head_run(int argc, char **argv)
+int head_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
     struct arg_lit  *help, *json;
     struct arg_int  *lines, *bytes;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[7];
 
-    build_head_argtable(&help, &lines, &bytes, &json, &files, &end, &argtable);
+    build_head_argtable(&help, &lines, &bytes, &json, &files, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        head_print_usage(stdout);
-        arg_freetable(argtable, 6);
+        head_print_usage(out_stream);
+        arg_freetable(tbl, 6);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "head");
         fprintf(stderr, "Try 'head --help' for more information.\n");
-        arg_freetable(argtable, 6);
+        arg_freetable(tbl, 6);
         return 1;
     }
 
@@ -185,20 +182,20 @@ int head_run(int argc, char **argv)
     int nfiles   = files->count;
     int ret      = 0;
 
-    if (use_json) printf("[\n");
+    if (use_json) fprintf(out_stream, "[\n");
 
     if (nfiles == 0) {
         if (use_json)
-            ret = head_json(stdin, NULL, n_lines, 1);
+            ret = head_json(in_stream, out_stream, NULL, n_lines, 1);
         else if (n_bytes >= 0)
-            ret = head_bytes(stdin, n_bytes);
+            ret = head_bytes(in_stream, out_stream, n_bytes);
         else
-            ret = head_lines(stdin, n_lines);
+            ret = head_lines(in_stream, out_stream, n_lines);
     } else {
         for (int i = 0; i < nfiles; i++) {
             const char *path     = files->filename[i];
             int         is_stdin = strcmp(path, "-") == 0;
-            FILE       *fp       = is_stdin ? stdin : fopen(path, "r");
+            FILE       *fp       = is_stdin ? in_stream : fopen(path, "r");
 
             if (!fp) {
                 fprintf(stderr, "head: %s: %s\n", path, strerror(errno));
@@ -207,23 +204,23 @@ int head_run(int argc, char **argv)
             }
 
             if (nfiles > 1 && !use_json)
-                printf("==> %s <==\n", path);
+                fprintf(out_stream, "==> %s <==\n", path);
 
             if (use_json)
-                ret |= head_json(fp, is_stdin ? NULL : path, n_lines, i == nfiles - 1);
+                ret |= head_json(fp, out_stream, is_stdin ? NULL : path, n_lines, i == nfiles - 1);
             else if (n_bytes >= 0)
-                ret |= head_bytes(fp, n_bytes);
+                ret |= head_bytes(fp, out_stream, n_bytes);
             else
-                ret |= head_lines(fp, n_lines);
+                ret |= head_lines(fp, out_stream, n_lines);
 
             if (!is_stdin) fclose(fp);
-            if (nfiles > 1 && !use_json && i < nfiles - 1) putchar('\n');
+            if (nfiles > 1 && !use_json && i < nfiles - 1) fputc('\n', out_stream);
         }
     }
 
-    if (use_json) printf("]\n");
+    if (use_json) fprintf(out_stream, "]\n");
 
-    arg_freetable(argtable, 6);
+    arg_freetable(tbl, 6);
     return ret;
 }
 

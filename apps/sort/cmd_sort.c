@@ -19,7 +19,7 @@ static void build_sort_argtable(
     struct arg_lit  **json,
     struct arg_file **files,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 10 slots */
 {
     *help    = arg_lit0("h", "help",         "show this help and exit");
     *reverse = arg_lit0("r", "reverse",      "reverse the sort order");
@@ -31,7 +31,6 @@ static void build_sort_argtable(
     *files   = arg_filen(NULL, NULL, "[FILE...]", 0, 64, "files to sort (default: stdin)");
     *end     = arg_end(20);
 
-    static void *tbl[10];
     tbl[0] = *help;
     tbl[1] = *reverse;
     tbl[2] = *numeric;
@@ -42,8 +41,6 @@ static void build_sort_argtable(
     tbl[7] = *files;
     tbl[8] = *end;
     tbl[9] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -64,21 +61,22 @@ static void json_escape(FILE *out, const char *s, size_t len)
     }
 }
 
-/* Comparator state (sort is single-threaded). */
-static int  g_reverse;
-static int  g_numeric;
-static int  g_key;    /* 1-based; 0 = whole line */
-static char g_sep;    /* '\0' = split on whitespace */
+typedef struct {
+    int  reverse;
+    int  numeric;
+    int  key;   /* 1-based; 0 = whole line */
+    char sep;   /* '\0' = split on whitespace */
+} sort_ctx_t;
 
-/* Return pointer to start of the Nth (1-based) field in line. */
-static const char *get_field(const char *line, int field)
+static const char *get_field(const char *line, const sort_ctx_t *ctx)
 {
+    int field = ctx->key;
     if (field <= 0) return line;
 
     int f = 1;
     const char *p = line;
 
-    if (g_sep == '\0') {
+    if (ctx->sep == '\0') {
         while (*p == ' ' || *p == '\t') p++;
         while (f < field) {
             while (*p && *p != ' ' && *p != '\t') p++;
@@ -88,7 +86,7 @@ static const char *get_field(const char *line, int field)
         }
     } else {
         while (f < field) {
-            p = strchr(p, g_sep);
+            p = strchr(p, ctx->sep);
             if (!p) return line;
             p++;
             f++;
@@ -97,22 +95,23 @@ static const char *get_field(const char *line, int field)
     return p;
 }
 
-static int sort_cmp(const void *a, const void *b)
+static int sort_cmp(const void *a, const void *b, void *vctx)
 {
+    const sort_ctx_t *ctx = vctx;
     const char *la = *(const char * const *)a;
     const char *lb = *(const char * const *)b;
-    const char *sa = get_field(la, g_key);
-    const char *sb = get_field(lb, g_key);
+    const char *sa = get_field(la, ctx);
+    const char *sb = get_field(lb, ctx);
 
     int r;
-    if (g_numeric) {
+    if (ctx->numeric) {
         double da = strtod(sa, NULL);
         double db = strtod(sb, NULL);
         r = (da > db) - (da < db);
     } else {
         r = strcmp(sa, sb);
     }
-    return g_reverse ? -r : r;
+    return ctx->reverse ? -r : r;
 }
 
 static int read_all_lines(FILE *fp, char ***lines_out)
@@ -151,54 +150,56 @@ void sort_print_usage(FILE *out)
     struct arg_str  *sep;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[10];
 
     build_sort_argtable(&help, &reverse, &numeric, &unique, &key, &sep,
-                        &json, &files, &end, &argtable);
+                        &json, &files, &end, tbl);
 
     fprintf(out, "Usage: sort ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nSort lines of text files.\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-26s %s\n");
+    arg_print_glossary(out, tbl, "  %-26s %s\n");
 
-    arg_freetable(argtable, 9);
+    arg_freetable(tbl, 9);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int sort_run(int argc, char **argv)
+int sort_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
     struct arg_lit  *help, *reverse, *numeric, *unique, *json;
     struct arg_int  *key;
     struct arg_str  *sep;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[10];
 
     build_sort_argtable(&help, &reverse, &numeric, &unique, &key, &sep,
-                        &json, &files, &end, &argtable);
+                        &json, &files, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        sort_print_usage(stdout);
-        arg_freetable(argtable, 9);
+        sort_print_usage(out_stream);
+        arg_freetable(tbl, 9);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "sort");
         fprintf(stderr, "Try 'sort --help' for more information.\n");
-        arg_freetable(argtable, 9);
+        arg_freetable(tbl, 9);
         return 1;
     }
 
-    g_reverse = reverse->count > 0;
-    g_numeric = numeric->count > 0;
+    sort_ctx_t ctx = {
+        .reverse = reverse->count > 0,
+        .numeric = numeric->count > 0,
+        .key     = key->count > 0 ? key->ival[0] : 0,
+        .sep     = (sep->count > 0 && sep->sval[0][0]) ? sep->sval[0][0] : '\0',
+    };
     int use_unique = unique->count > 0;
-    g_key     = key->count > 0 ? key->ival[0] : 0;
-    g_sep     = (sep->count > 0 && sep->sval[0][0]) ? sep->sval[0][0] : '\0';
 
     int use_json = json->count > 0;
     int nfiles   = files->count;
@@ -214,14 +215,14 @@ int sort_run(int argc, char **argv)
         int n = read_all_lines(fp, &batch); \
         if (n < 0) { \
             fprintf(stderr, "sort: out of memory\n"); \
-            arg_freetable(argtable, 9); return 1; \
+            arg_freetable(tbl, 9); return 1; \
         } \
         if (total + n > cap) { \
             cap = (total + n) * 2 + 64; \
             char **tmp = realloc(lines, cap * sizeof(char *)); \
             if (!tmp) { \
                 fprintf(stderr, "sort: out of memory\n"); \
-                free(batch); arg_freetable(argtable, 9); return 1; \
+                free(batch); arg_freetable(tbl, 9); return 1; \
             } \
             lines = tmp; \
         } \
@@ -230,12 +231,12 @@ int sort_run(int argc, char **argv)
     } while (0)
 
     if (nfiles == 0) {
-        APPEND_LINES(stdin);
+        APPEND_LINES(in_stream);
     } else {
         for (int i = 0; i < nfiles; i++) {
             const char *path     = files->filename[i];
             int         is_stdin = strcmp(path, "-") == 0;
-            FILE       *fp       = is_stdin ? stdin : fopen(path, "r");
+            FILE       *fp       = is_stdin ? in_stream : fopen(path, "r");
             if (!fp) {
                 fprintf(stderr, "sort: %s: %s\n", path, strerror(errno));
                 ret = 1;
@@ -246,13 +247,13 @@ int sort_run(int argc, char **argv)
         }
     }
 
-    qsort(lines, total, sizeof(char *), sort_cmp);
+    qsort_r(lines, total, sizeof(char *), sort_cmp, &ctx);
 
     /* Mark duplicate lines as NULL when -u is active. */
     if (use_unique && total > 0) {
         for (int i = 1; i < total; i++) {
             char *prev = lines[i - 1];
-            if (prev && sort_cmp(&lines[i], &prev) == 0) {
+            if (prev && sort_cmp(&lines[i], &prev, &ctx) == 0) {
                 free(lines[i]);
                 lines[i] = NULL;
             }
@@ -263,7 +264,7 @@ int sort_run(int argc, char **argv)
     int out_count = 0;
     for (int i = 0; i < total; i++) if (lines[i]) out_count++;
 
-    if (use_json) printf("[\n");
+    if (use_json) fprintf(out_stream, "[\n");
 
     int printed = 0;
     for (int i = 0; i < total; i++) {
@@ -271,20 +272,20 @@ int sort_run(int argc, char **argv)
         size_t len = strlen(lines[i]);
         if (use_json) {
             size_t slen = (len > 0 && lines[i][len - 1] == '\n') ? len - 1 : len;
-            printf("  \"");
-            json_escape(stdout, lines[i], slen);
+            fprintf(out_stream, "  \"");
+            json_escape(out_stream, lines[i], slen);
             printed++;
-            printf("\"%s\n", printed == out_count ? "" : ",");
+            fprintf(out_stream, "\"%s\n", printed == out_count ? "" : ",");
         } else {
-            fwrite(lines[i], 1, len, stdout);
+            fwrite(lines[i], 1, len, out_stream);
         }
         free(lines[i]);
     }
 
-    if (use_json) printf("]\n");
+    if (use_json) fprintf(out_stream, "]\n");
 
     free(lines);
-    arg_freetable(argtable, 9);
+    arg_freetable(tbl, 9);
     return ret;
 }
 

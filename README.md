@@ -85,6 +85,56 @@ make -C apps/pkg
 
 Each app produces a standalone binary (e.g. `apps/ls/ls`) and a static library (e.g. `apps/ls/libls.a`). The shell links the `.o` files directly from each app so there is only one copy of `argtable3` in the final binary.
 
+## Testing
+
+`test_apps.sh` is a manual test runner that exercises every app and the shell's pipeline executor. Run it from the repo root after building:
+
+```sh
+./test_apps.sh                          # run all 36 tests
+./test_apps.sh --test 1                 # run a single test by number
+./test_apps.sh --test 1 --test 2        # run multiple specific tests
+```
+
+Each test prints the command being run, the actual output on pass, and a diff of expected vs. got on mismatch. Pipeline tests run through `mysh` and show the pipeline string directly:
+
+```
+Test 1    hello — default greeting
+  $ ./apps/hello/hello
+  PASS
+    Hello, World!
+
+Test 33   pipe 4-stage: cat | sort | uniq -c | sort -rn  (2 concurrent sort threads)
+  [mysh]$ cat /tmp/rb_fruits.txt | sort | uniq -c | sort -rn
+  PASS
+          2 apple
+          2 banana
+          1 cherry
+```
+
+A summary line is printed at the end and the script exits non-zero if any test failed.
+
+**Test index:**
+
+| Range | App / feature |
+|---|---|
+| 1–2 | `hello` — greeting, custom name |
+| 3–4 | `ls` — directory listing, JSON output |
+| 5 | `stat` — file metadata |
+| 6–7 | `wc` — default counts, line-only |
+| 8–10 | `cat` — plain, numbered lines, show-ends |
+| 11–13 | `echo` — basic, escape sequences, suppress newline |
+| 14–15 | `head` / `tail` — first N and last N lines |
+| 16–18 | `grep` — match, count, invert |
+| 19–24 | `sort` — alpha, reverse, numeric, numeric-reverse, unique, field sort |
+| 25–26 | `uniq` — adjacent dedup, count occurrences |
+| 27–28 | `cut` — field extraction, character range |
+| 29 | `tee` — stdout passthrough + file write verified |
+| 30–36 | Pipelines — 2- through 6-stage concurrent thread pipelines through `mysh` |
+
+Test 33 specifically targets the thread-safety fix for `sort`: it runs two `sort` stages concurrently in the same pipeline (`cat | sort | uniq -c | sort -rn`) and verifies they produce correct output despite sharing the same process address space.
+
+---
+
 ## Commands
 
 ### `hello` — reference implementation
@@ -617,7 +667,10 @@ shell/mysh              # interactive mode
 shell/mysh script.sh    # run a script file
 ```
 
-`mysh` is a small Unix shell that runs all registered commands in-process (no fork overhead for `ls`, `wc`, `cat`, etc.) and falls back to `fork` + `execvp` for anything else in `PATH`.
+`mysh` is a small Unix shell that runs all registered commands in-process and falls back to `fork` + `execvp` for anything else in `PATH`.
+
+- **Single-stage commands** run directly in the shell process — no fork, no exec.
+- **Multi-stage pipelines** run each registered stage as a concurrent POSIX thread, connected by `pipe()` + `fdopen()`. External commands in the same pipeline still fork. Stages overlap in time: downstream threads start consuming data before upstream threads finish producing it.
 
 ### Starting the shell
 
@@ -637,7 +690,8 @@ The prompt shows the last exit code when non-zero: `mysh [1]> `.
 
 | Feature | Example |
 |---|---|
-| Registered commands (in-process) | `ls -a`, `wc -l file`, `cat file`, `echo hello`, `head -n 5 file`, `tail -n 5 file`, `grep foo file`, `sort -n`, `uniq -c`, `cut -f1 -d:`, `tee out.txt`, `stat file` |
+| Registered commands (in-process, no fork) | `ls -a`, `wc -l file`, `cat file`, `echo hello`, `head -n 5 file`, `tail -n 5 file`, `grep foo file`, `sort -n`, `uniq -c`, `cut -f1 -d:`, `tee out.txt`, `stat file` |
+| Concurrent threaded pipelines | `cat file \| grep pat \| sort \| uniq -c` — stages run as threads, not forks |
 | External commands (via PATH) | `git status`, `python3 script.py` |
 | Input redirection | `wc -l < file.txt` |
 | Output redirection | `ls > out.txt` |
@@ -664,6 +718,50 @@ apps/pkg/pkg install mytool-1.0.0.tar.gz
 shell/mysh
 mysh> mytool          # found via ~/.mysh/bin
 ```
+
+### Thread-safe pipeline execution
+
+When all stages in a pipeline are registered commands, every stage runs as a concurrent POSIX thread. Pipes connect them: each thread reads from `FILE *in` and writes to `FILE *out`, which are backed by `fdopen`'d pipe ends. No thread ever calls `dup2` — the streams are passed explicitly, so threads do not race on fd 0/1.
+
+The architecture has two properties that make this safe:
+
+**Explicit stream parameters.** Every `run()` function is declared:
+```c
+int (*run)(int argc, char **argv, FILE *in_stream, FILE *out_stream);
+```
+Threads receive isolated `FILE*` objects constructed from pipe fds. Each thread closes its streams on exit, which signals EOF to the downstream thread.
+
+**Stack-allocated argtable3 tables.** Each `build_<name>_argtable()` call writes into a `void *tbl[N]` the caller places on its own stack frame. Two concurrent calls to the same builder cannot share state.
+
+**`sort` uses `qsort_r`.** Comparator options (`-r`, `-n`, `-k`, `-t`) are held in a `sort_ctx_t` struct on the stack and passed through `qsort_r`'s context pointer. Two concurrent `sort` stages in the same pipeline are fully independent.
+
+**Try it — all-internal 5-stage pipeline:**
+```sh
+mysh> cat apps/hello/cmd_hello.c | grep include | sort | uniq -c | sort -rn
+```
+All five stages (`cat`, `grep`, `sort`, `uniq`, `sort`) run as concurrent threads. Data flows through four pipes simultaneously.
+
+**Watch with `strace` to confirm no forks for internal commands:**
+```sh
+strace -e trace=clone,fork,vfork -f shell/mysh 2>&1 <<'EOF'
+cat apps/cat/cmd_cat.c | grep include | sort -r | uniq
+EOF
+```
+You will see `clone` calls (threads) for the registered stages and no `fork`/`clone` with `SIGCHLD` (process fork) unless a stage falls back to an external binary.
+
+**`tee` mid-pipeline — one thread fans out to stdout and a file simultaneously:**
+```sh
+mysh> cat apps/cat/cmd_cat.c | grep include | tee /tmp/includes.txt | wc -l
+```
+The `tee` thread writes to both the pipe (going to `wc`) and the file in the same read loop iteration — no extra buffering, no second pass.
+
+**Long dedup pipeline — canonical use case:**
+```sh
+mysh> cat apps/*/cmd_*.c | grep "^#include" | sort | uniq -c | sort -rn | head -5
+```
+Six stages run as six threads. `cat` starts writing; `grep` starts filtering before `cat` finishes; `sort` buffers but begins as soon as `grep` closes its pipe; `uniq` and the second `sort` follow in turn; `head` exits after 5 lines, closing its pipe and causing `sort` to receive SIGPIPE upstream.
+
+**Isolation from the shell's fd 0.** When `mysh` reads commands from a pipe or script file, it `dup`s that fd to a private `g_cmd_fd` and leaves fd 0 alone. Pipeline threads receive `fdopen(dup(STDIN_FILENO), "r")` for the first stage, so they can safely `fclose` their input without touching the shell's command stream.
 
 ### Example session
 
@@ -745,12 +843,14 @@ typedef struct cmd_spec {
     const char *name;
     const char *summary;
     const char *long_help;
-    int  (*run)(int argc, char **argv);
+    int  (*run)(int argc, char **argv, FILE *in_stream, FILE *out_stream);
     void (*print_usage)(FILE *out);
 } cmd_spec_t;
 ```
 
-Each module uses a shared `build_<name>_argtable()` helper so that `run()` and `print_usage()` always stay in sync. This makes `argtable3` the single source of truth for CLI parsing, `--help` text, and future package documentation.
+The `FILE *in_stream, FILE *out_stream` parameters are the key to thread-safe pipeline execution: the shell passes pipe-backed `FILE*` objects to each thread instead of redirecting fd 0/1, so concurrent stages never race on shared file descriptors.
+
+Each module uses a shared `build_<name>_argtable()` helper — with the table allocated on the caller's stack — so that `run()` and `print_usage()` always stay in sync and concurrent invocations never share mutable state. This makes `argtable3` the single source of truth for CLI parsing, `--help` text, and future package documentation.
 
 The `apps/hello/` module is the canonical reference implementation. It also includes `registry.c` — a minimal in-memory command registry (`registry_register`, `registry_find`, `registry_print_all`) that the shell will use for built-in dispatch.
 

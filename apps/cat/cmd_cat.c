@@ -16,7 +16,7 @@ static void build_cat_argtable(
     struct arg_lit  **json,
     struct arg_file **files,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)        /* caller-allocated array of 7 slots */
 {
     *help      = arg_lit0("h", "help",      "show this help and exit");
     *number    = arg_lit0("n", "number",    "number all output lines");
@@ -25,7 +25,6 @@ static void build_cat_argtable(
     *files     = arg_filen(NULL, NULL, "[FILE...]", 0, 64, "files to concatenate (default: stdin)");
     *end       = arg_end(20);
 
-    static void *tbl[7];
     tbl[0] = *help;
     tbl[1] = *number;
     tbl[2] = *show_ends;
@@ -33,8 +32,6 @@ static void build_cat_argtable(
     tbl[4] = *files;
     tbl[5] = *end;
     tbl[6] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -60,7 +57,7 @@ static void json_escape(FILE *out, const char *s, size_t len)
  * stream processing
  * -------------------------------------------------------------------------- */
 
-static int cat_plain(FILE *fp, int number, int show_ends)
+static int cat_plain(FILE *fp, FILE *out, int number, int show_ends)
 {
     char   *line = NULL;
     size_t  cap  = 0;
@@ -69,16 +66,16 @@ static int cat_plain(FILE *fp, int number, int show_ends)
 
     while ((len = getline(&line, &cap, fp)) != -1) {
         lineno++;
-        if (number) printf("%6lld\t", lineno);
+        if (number) fprintf(out, "%6lld\t", lineno);
 
         if (show_ends) {
             /* Strip trailing newline, print $, then newline. */
             ssize_t printlen = len;
             if (printlen > 0 && line[printlen - 1] == '\n') printlen--;
-            fwrite(line, 1, printlen, stdout);
-            printf("$\n");
+            fwrite(line, 1, printlen, out);
+            fprintf(out, "$\n");
         } else {
-            fwrite(line, 1, len, stdout);
+            fwrite(line, 1, len, out);
         }
     }
 
@@ -86,7 +83,7 @@ static int cat_plain(FILE *fp, int number, int show_ends)
     return ferror(fp) ? 1 : 0;
 }
 
-static int cat_json(FILE *fp, const char *label, int is_last)
+static int cat_json(FILE *fp, FILE *out, const char *label, int is_last)
 {
     /* Read entire stream into a buffer, then emit as a JSON object. */
     char   *buf  = NULL;
@@ -107,15 +104,15 @@ static int cat_json(FILE *fp, const char *label, int is_last)
 
     int err = ferror(fp);
 
-    printf("  {");
+    fprintf(out, "  {");
     if (label) {
-        printf("\"file\": \"");
-        json_escape(stdout, label, strlen(label));
-        printf("\", ");
+        fprintf(out, "\"file\": \"");
+        json_escape(out, label, strlen(label));
+        fprintf(out, "\", ");
     }
-    printf("\"content\": \"");
-    if (buf) json_escape(stdout, buf, size);
-    printf("\"}%s\n", is_last ? "" : ",");
+    fprintf(out, "\"content\": \"");
+    if (buf) json_escape(out, buf, size);
+    fprintf(out, "\"}%s\n", is_last ? "" : ",");
 
     free(buf);
     return err ? 1 : 0;
@@ -130,42 +127,42 @@ void cat_print_usage(FILE *out)
     struct arg_lit  *help, *number, *show_ends, *json;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[7];
 
-    build_cat_argtable(&help, &number, &show_ends, &json, &files, &end, &argtable);
+    build_cat_argtable(&help, &number, &show_ends, &json, &files, &end, tbl);
 
     fprintf(out, "Usage: cat ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nConcatenate files and print to standard output.\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-22s %s\n");
+    arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(argtable, 6);
+    arg_freetable(tbl, 6);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int cat_run(int argc, char **argv)
+int cat_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
     struct arg_lit  *help, *number, *show_ends, *json;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[7];
 
-    build_cat_argtable(&help, &number, &show_ends, &json, &files, &end, &argtable);
+    build_cat_argtable(&help, &number, &show_ends, &json, &files, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        cat_print_usage(stdout);
-        arg_freetable(argtable, 6);
+        cat_print_usage(out_stream);
+        arg_freetable(tbl, 6);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "cat");
         fprintf(stderr, "Try 'cat --help' for more information.\n");
-        arg_freetable(argtable, 6);
+        arg_freetable(tbl, 6);
         return 1;
     }
 
@@ -175,20 +172,20 @@ int cat_run(int argc, char **argv)
     int nfiles        = files->count;
     int ret           = 0;
 
-    if (use_json) printf("[\n");
+    if (use_json) fprintf(out_stream, "[\n");
 
     if (nfiles == 0) {
         if (use_json)
-            ret = cat_json(stdin, NULL, 1);
+            ret = cat_json(in_stream, out_stream, NULL, 1);
         else
-            ret = cat_plain(stdin, use_number, use_show_ends);
+            ret = cat_plain(in_stream, out_stream, use_number, use_show_ends);
     } else {
         for (int i = 0; i < nfiles; i++) {
             const char *path = files->filename[i];
             FILE *fp;
             int is_stdin = (strcmp(path, "-") == 0);
 
-            fp = is_stdin ? stdin : fopen(path, "rb");
+            fp = is_stdin ? in_stream : fopen(path, "rb");
             if (!fp) {
                 fprintf(stderr, "cat: %s: %s\n", path, strerror(errno));
                 ret = 1;
@@ -196,17 +193,17 @@ int cat_run(int argc, char **argv)
             }
 
             if (use_json)
-                ret |= cat_json(fp, is_stdin ? NULL : path, i == nfiles - 1);
+                ret |= cat_json(fp, out_stream, is_stdin ? NULL : path, i == nfiles - 1);
             else
-                ret |= cat_plain(fp, use_number, use_show_ends);
+                ret |= cat_plain(fp, out_stream, use_number, use_show_ends);
 
             if (!is_stdin) fclose(fp);
         }
     }
 
-    if (use_json) printf("]\n");
+    if (use_json) fprintf(out_stream, "]\n");
 
-    arg_freetable(argtable, 6);
+    arg_freetable(tbl, 6);
     return ret;
 }
 

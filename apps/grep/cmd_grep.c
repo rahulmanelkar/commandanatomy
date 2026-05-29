@@ -21,7 +21,7 @@ static void build_grep_argtable(
     struct arg_str  **pattern,
     struct arg_file **files,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 11 slots */
 {
     *help       = arg_lit0("h", "help",              "show this help and exit");
     *ignore_case= arg_lit0("i", "ignore-case",       "ignore case distinctions in PATTERN");
@@ -34,7 +34,6 @@ static void build_grep_argtable(
     *files      = arg_filen(NULL, NULL, "[FILE...]", 0, 64, "files to search (default: stdin)");
     *end        = arg_end(20);
 
-    static void *tbl[11];
     tbl[0]  = *help;
     tbl[1]  = *ignore_case;
     tbl[2]  = *line_number;
@@ -46,8 +45,6 @@ static void build_grep_argtable(
     tbl[8]  = *files;
     tbl[9]  = *end;
     tbl[10] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -79,7 +76,7 @@ typedef struct {
 } grep_opts;
 
 /* Returns number of matching lines (or -1 on error). */
-static int grep_stream(FILE *fp, const char *label, grep_opts *opts,
+static int grep_stream(FILE *fp, FILE *out, const char *label, grep_opts *opts,
                        int is_last_file)
 {
     char   *line  = NULL;
@@ -119,10 +116,10 @@ static int grep_stream(FILE *fp, const char *label, grep_opts *opts,
             if (opts->count || opts->files_with)
                 continue;
 
-            if (opts->show_filename) printf("%s:", label ? label : "(stdin)");
-            if (opts->line_number)   printf("%ld:", lineno);
-            fwrite(line, 1, print_len, stdout);
-            if (print_len == 0 || line[print_len - 1] != '\n') putchar('\n');
+            if (opts->show_filename) fprintf(out, "%s:", label ? label : "(stdin)");
+            if (opts->line_number)   fprintf(out, "%ld:", lineno);
+            fwrite(line, 1, print_len, out);
+            if (print_len == 0 || line[print_len - 1] != '\n') fputc('\n', out);
         }
     }
 
@@ -130,34 +127,42 @@ static int grep_stream(FILE *fp, const char *label, grep_opts *opts,
 
     if (opts->use_json) {
         if (opts->count) {
-            printf("  {");
-            if (label) { printf("\"file\": \""); json_escape(stdout, label, strlen(label)); printf("\", "); }
-            printf("\"count\": %d}%s\n", matches, is_last_file ? "" : ",");
+            fprintf(out, "  {");
+            if (label) {
+                fprintf(out, "\"file\": \"");
+                json_escape(out, label, strlen(label));
+                fprintf(out, "\", ");
+            }
+            fprintf(out, "\"count\": %d}%s\n", matches, is_last_file ? "" : ",");
         } else if (opts->files_with) {
             if (matches > 0) {
-                printf("  \"");
-                json_escape(stdout, label ? label : "(stdin)", strlen(label ? label : "(stdin)"));
-                printf("\"%s\n", is_last_file ? "" : ",");
+                fprintf(out, "  \"");
+                json_escape(out, label ? label : "(stdin)", strlen(label ? label : "(stdin)"));
+                fprintf(out, "\"%s\n", is_last_file ? "" : ",");
             }
         } else {
-            printf("  {");
-            if (label) { printf("\"file\": \""); json_escape(stdout, label, strlen(label)); printf("\", "); }
-            printf("\"matches\": [\n");
+            fprintf(out, "  {");
+            if (label) {
+                fprintf(out, "\"file\": \"");
+                json_escape(out, label, strlen(label));
+                fprintf(out, "\", ");
+            }
+            fprintf(out, "\"matches\": [\n");
             for (int i = 0; i < matches; i++) {
-                printf("    {\"line\": %ld, \"text\": \"", matched[i].lineno);
-                json_escape(stdout, matched[i].text, matched[i].tlen);
-                printf("\"}%s\n", i == matches - 1 ? "" : ",");
+                fprintf(out, "    {\"line\": %ld, \"text\": \"", matched[i].lineno);
+                json_escape(out, matched[i].text, matched[i].tlen);
+                fprintf(out, "\"}%s\n", i == matches - 1 ? "" : ",");
                 free(matched[i].text);
             }
-            printf("  ]}%s\n", is_last_file ? "" : ",");
+            fprintf(out, "  ]}%s\n", is_last_file ? "" : ",");
             free(matched);
         }
     } else {
         if (opts->count) {
-            if (opts->show_filename) printf("%s:", label ? label : "(stdin)");
-            printf("%d\n", matches);
+            if (opts->show_filename) fprintf(out, "%s:", label ? label : "(stdin)");
+            fprintf(out, "%d\n", matches);
         } else if (opts->files_with && matches > 0) {
-            printf("%s\n", label ? label : "(stdin)");
+            fprintf(out, "%s\n", label ? label : "(stdin)");
         }
     }
 
@@ -174,45 +179,45 @@ void grep_print_usage(FILE *out)
     struct arg_str  *pattern;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[11];
 
     build_grep_argtable(&help, &ignore_case, &line_number, &count, &invert,
-                        &files_with, &json, &pattern, &files, &end, &argtable);
+                        &files_with, &json, &pattern, &files, &end, tbl);
 
     fprintf(out, "Usage: grep ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nSearch for PATTERN in each FILE (or stdin).\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-28s %s\n");
+    arg_print_glossary(out, tbl, "  %-28s %s\n");
 
-    arg_freetable(argtable, 10);
+    arg_freetable(tbl, 10);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int grep_run(int argc, char **argv)
+int grep_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
     struct arg_lit  *help, *ignore_case, *line_number, *count, *invert, *files_with, *json;
     struct arg_str  *pattern;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[11];
 
     build_grep_argtable(&help, &ignore_case, &line_number, &count, &invert,
-                        &files_with, &json, &pattern, &files, &end, &argtable);
+                        &files_with, &json, &pattern, &files, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        grep_print_usage(stdout);
-        arg_freetable(argtable, 10);
+        grep_print_usage(out_stream);
+        arg_freetable(tbl, 10);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "grep");
         fprintf(stderr, "Try 'grep --help' for more information.\n");
-        arg_freetable(argtable, 10);
+        arg_freetable(tbl, 10);
         return 1;
     }
 
@@ -223,7 +228,7 @@ int grep_run(int argc, char **argv)
         char errbuf[256];
         regerror(rc, &re, errbuf, sizeof(errbuf));
         fprintf(stderr, "grep: invalid pattern: %s\n", errbuf);
-        arg_freetable(argtable, 10);
+        arg_freetable(tbl, 10);
         return 2;
     }
 
@@ -241,15 +246,10 @@ int grep_run(int argc, char **argv)
     int total_match = 0;
     int ret         = 0;
 
-    if (opts.use_json) {
-        if (opts.files_with)
-            printf("[\n");
-        else
-            printf("[\n");
-    }
+    if (opts.use_json) fprintf(out_stream, "[\n");
 
     if (nfiles == 0) {
-        int m = grep_stream(stdin, NULL, &opts, 1);
+        int m = grep_stream(in_stream, out_stream, NULL, &opts, 1);
         if (m < 0) ret = 2;
         else if (m == 0) ret = 1;
         total_match += m < 0 ? 0 : m;
@@ -257,7 +257,7 @@ int grep_run(int argc, char **argv)
         for (int i = 0; i < nfiles; i++) {
             const char *path     = files->filename[i];
             int         is_stdin = strcmp(path, "-") == 0;
-            FILE       *fp       = is_stdin ? stdin : fopen(path, "r");
+            FILE       *fp       = is_stdin ? in_stream : fopen(path, "r");
 
             if (!fp) {
                 fprintf(stderr, "grep: %s: %s\n", path, strerror(errno));
@@ -265,7 +265,7 @@ int grep_run(int argc, char **argv)
                 continue;
             }
 
-            int m = grep_stream(fp, is_stdin ? NULL : path, &opts, i == nfiles - 1);
+            int m = grep_stream(fp, out_stream, is_stdin ? NULL : path, &opts, i == nfiles - 1);
             if (m < 0) ret = 2;
             else if (m == 0 && ret == 0) ret = 1;
             else if (m > 0) ret = 0;
@@ -275,10 +275,10 @@ int grep_run(int argc, char **argv)
         }
     }
 
-    if (opts.use_json) printf("]\n");
+    if (opts.use_json) fprintf(out_stream, "]\n");
 
     regfree(&re);
-    arg_freetable(argtable, 10);
+    arg_freetable(tbl, 10);
 
     /* grep exit code: 0=match found, 1=no match, 2=error */
     return ret;

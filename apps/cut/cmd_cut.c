@@ -17,7 +17,7 @@ static void build_cut_argtable(
     struct arg_lit  **json,
     struct arg_file **files,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 8 slots */
 {
     *help   = arg_lit0("h", "help",        "show this help and exit");
     *fields = arg_str0("f", "fields", "LIST", "select fields (e.g. 1,3 or 1-3,5)");
@@ -27,7 +27,6 @@ static void build_cut_argtable(
     *files  = arg_filen(NULL, NULL, "[FILE...]", 0, 64, "files to cut (default: stdin)");
     *end    = arg_end(20);
 
-    static void *tbl[8];
     tbl[0] = *help;
     tbl[1] = *fields;
     tbl[2] = *chars;
@@ -36,8 +35,6 @@ static void build_cut_argtable(
     tbl[5] = *files;
     tbl[6] = *end;
     tbl[7] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -141,7 +138,7 @@ static void cut_chars(const char *line, size_t len, const char selected[MAX_POSI
     }
 }
 
-static int cut_stream(FILE *fp, const char selected[MAX_POSITIONS], char delim,
+static int cut_stream(FILE *fp, FILE *out, const char selected[MAX_POSITIONS], char delim,
                       int do_fields, int use_json, const char *label, int is_last)
 {
     char   *line = NULL;
@@ -150,35 +147,39 @@ static int cut_stream(FILE *fp, const char selected[MAX_POSITIONS], char delim,
     int     first_line = 1;
 
     if (use_json) {
-        printf("  {");
-        if (label) { printf("\"file\": \""); json_escape(stdout, label, strlen(label)); printf("\", "); }
-        printf("\"lines\": [\n");
+        fprintf(out, "  {");
+        if (label) {
+            fprintf(out, "\"file\": \"");
+            json_escape(out, label, strlen(label));
+            fprintf(out, "\", ");
+        }
+        fprintf(out, "\"lines\": [\n");
     }
 
     while ((len = getline(&line, &cap, fp)) != -1) {
         if (use_json) {
-            if (!first_line) printf(",\n");
-            printf("    \"");
+            if (!first_line) fprintf(out, ",\n");
+            fprintf(out, "    \"");
             if (do_fields)
-                cut_fields(line, len, selected, delim, stdout, 1);
+                cut_fields(line, len, selected, delim, out, 1);
             else
-                cut_chars(line, len, selected, stdout, 1);
-            printf("\"");
+                cut_chars(line, len, selected, out, 1);
+            fprintf(out, "\"");
             first_line = 0;
         } else {
             if (do_fields)
-                cut_fields(line, len, selected, delim, stdout, 0);
+                cut_fields(line, len, selected, delim, out, 0);
             else
-                cut_chars(line, len, selected, stdout, 0);
-            putchar('\n');
+                cut_chars(line, len, selected, out, 0);
+            fputc('\n', out);
         }
     }
 
     free(line);
 
     if (use_json) {
-        if (!first_line) putchar('\n');
-        printf("  ]}%s\n", is_last ? "" : ",");
+        if (!first_line) fputc('\n', out);
+        fprintf(out, "  ]}%s\n", is_last ? "" : ",");
     }
 
     return ferror(fp) ? 1 : 0;
@@ -194,55 +195,55 @@ void cut_print_usage(FILE *out)
     struct arg_str  *fields, *chars, *delim;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[8];
 
-    build_cut_argtable(&help, &fields, &chars, &delim, &json, &files, &end, &argtable);
+    build_cut_argtable(&help, &fields, &chars, &delim, &json, &files, &end, tbl);
 
     fprintf(out, "Usage: cut ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nRemove sections from each line of files.\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-28s %s\n");
+    arg_print_glossary(out, tbl, "  %-28s %s\n");
     fprintf(out, "\nLIST format: comma-separated numbers or ranges, e.g. 1,3-5,7\n");
 
-    arg_freetable(argtable, 7);
+    arg_freetable(tbl, 7);
 }
 
 /* --------------------------------------------------------------------------
  * run
  * -------------------------------------------------------------------------- */
 
-int cut_run(int argc, char **argv)
+int cut_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
     struct arg_lit  *help, *json;
     struct arg_str  *fields, *chars, *delim;
     struct arg_file *files;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[8];
 
-    build_cut_argtable(&help, &fields, &chars, &delim, &json, &files, &end, &argtable);
+    build_cut_argtable(&help, &fields, &chars, &delim, &json, &files, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        cut_print_usage(stdout);
-        arg_freetable(argtable, 7);
+        cut_print_usage(out_stream);
+        arg_freetable(tbl, 7);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "cut");
         fprintf(stderr, "Try 'cut --help' for more information.\n");
-        arg_freetable(argtable, 7);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
     if (fields->count == 0 && chars->count == 0) {
         fprintf(stderr, "cut: you must specify -f or -c\n");
-        arg_freetable(argtable, 7);
+        arg_freetable(tbl, 7);
         return 1;
     }
     if (fields->count > 0 && chars->count > 0) {
         fprintf(stderr, "cut: cannot use -f and -c together\n");
-        arg_freetable(argtable, 7);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
@@ -252,7 +253,7 @@ int cut_run(int argc, char **argv)
 
     if (parse_list(list_str, selected) < 0) {
         fprintf(stderr, "cut: invalid field/position list: %s\n", list_str);
-        arg_freetable(argtable, 7);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
@@ -264,29 +265,29 @@ int cut_run(int argc, char **argv)
     int nfiles   = files->count;
     int ret      = 0;
 
-    if (use_json) printf("[\n");
+    if (use_json) fprintf(out_stream, "[\n");
 
     if (nfiles == 0) {
-        ret = cut_stream(stdin, selected, sep, do_fields, use_json, NULL, 1);
+        ret = cut_stream(in_stream, out_stream, selected, sep, do_fields, use_json, NULL, 1);
     } else {
         for (int i = 0; i < nfiles; i++) {
             const char *path     = files->filename[i];
             int         is_stdin = strcmp(path, "-") == 0;
-            FILE       *fp       = is_stdin ? stdin : fopen(path, "r");
+            FILE       *fp       = is_stdin ? in_stream : fopen(path, "r");
             if (!fp) {
                 fprintf(stderr, "cut: %s: %s\n", path, strerror(errno));
                 ret = 1;
                 continue;
             }
-            ret |= cut_stream(fp, selected, sep, do_fields, use_json,
+            ret |= cut_stream(fp, out_stream, selected, sep, do_fields, use_json,
                               is_stdin ? NULL : path, i == nfiles - 1);
             if (!is_stdin) fclose(fp);
         }
     }
 
-    if (use_json) printf("]\n");
+    if (use_json) fprintf(out_stream, "]\n");
 
-    arg_freetable(argtable, 7);
+    arg_freetable(tbl, 7);
     return ret;
 }
 

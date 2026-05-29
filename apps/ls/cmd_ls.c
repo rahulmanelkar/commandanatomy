@@ -18,7 +18,7 @@ static void build_ls_argtable(
     struct arg_lit  **json,
     struct arg_file **paths,
     struct arg_end  **end,
-    void           ***argtable_out)
+    void            **tbl)         /* caller-allocated array of 6 slots */
 {
     *help  = arg_lit0("h", "help",  "show this help and exit");
     *all   = arg_lit0("a", "all",   "do not ignore entries starting with '.'");
@@ -26,15 +26,12 @@ static void build_ls_argtable(
     *paths = arg_filen(NULL, NULL, "[PATH...]", 0, 32, "files or directories to list");
     *end   = arg_end(20);
 
-    static void *tbl[6];
     tbl[0] = *help;
     tbl[1] = *all;
     tbl[2] = *json;
     tbl[3] = *paths;
     tbl[4] = *end;
     tbl[5] = NULL;
-
-    *argtable_out = tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -53,7 +50,7 @@ static const char *entry_type(mode_t m)
 }
 
 /* List one directory in plain text. Returns 0 on success, 1 on error. */
-static int list_dir_plain(const char *path, int show_all)
+static int list_dir_plain(FILE *out, const char *path, int show_all)
 {
     DIR *dp = opendir(path);
     if (!dp) {
@@ -64,14 +61,14 @@ static int list_dir_plain(const char *path, int show_all)
     while ((ent = readdir(dp)) != NULL) {
         if (!show_all && ent->d_name[0] == '.')
             continue;
-        printf("%s\n", ent->d_name);
+        fprintf(out, "%s\n", ent->d_name);
     }
     closedir(dp);
     return 0;
 }
 
 /* List one directory as JSON. Returns 0 on success, 1 on error. */
-static int list_dir_json(const char *path, int show_all)
+static int list_dir_json(FILE *out, const char *path, int show_all)
 {
     DIR *dp = opendir(path);
     if (!dp) {
@@ -79,7 +76,7 @@ static int list_dir_json(const char *path, int show_all)
         return 1;
     }
 
-    printf("{\n  \"path\": \"%s\",\n  \"entries\": [\n", path);
+    fprintf(out, "{\n  \"path\": \"%s\",\n  \"entries\": [\n", path);
 
     struct dirent *ent;
     int first = 1;
@@ -98,26 +95,26 @@ static int list_dir_json(const char *path, int show_all)
             size = (long long)st.st_size;
         }
 
-        if (!first) printf(",\n");
-        printf("    {\"name\": \"%s\", \"type\": \"%s\", \"size\": %lld}",
+        if (!first) fprintf(out, ",\n");
+        fprintf(out, "    {\"name\": \"%s\", \"type\": \"%s\", \"size\": %lld}",
                ent->d_name, type, size);
         first = 0;
     }
 
-    printf("\n  ]\n}\n");
+    fprintf(out, "\n  ]\n}\n");
     closedir(dp);
     return 0;
 }
 
 /* List a single non-directory entry (plain). */
-static int list_file_plain(const char *path)
+static int list_file_plain(FILE *out, const char *path)
 {
-    printf("%s\n", path);
+    fprintf(out, "%s\n", path);
     return 0;
 }
 
 /* List a single non-directory entry (JSON). */
-static int list_file_json(const char *path)
+static int list_file_json(FILE *out, const char *path)
 {
     struct stat st;
     const char *type = "unknown";
@@ -128,10 +125,10 @@ static int list_file_json(const char *path)
     }
     const char *name = strrchr(path, '/');
     name = name ? name + 1 : path;
-    printf("{\n  \"path\": \"%s\",\n  \"entries\": [\n", path);
-    printf("    {\"name\": \"%s\", \"type\": \"%s\", \"size\": %lld}\n",
+    fprintf(out, "{\n  \"path\": \"%s\",\n  \"entries\": [\n", path);
+    fprintf(out, "    {\"name\": \"%s\", \"type\": \"%s\", \"size\": %lld}\n",
            name, type, size);
-    printf("  ]\n}\n");
+    fprintf(out, "  ]\n}\n");
     return 0;
 }
 
@@ -146,45 +143,47 @@ void ls_print_usage(FILE *out)
     struct arg_lit  *json;
     struct arg_file *paths;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[6];
 
-    build_ls_argtable(&help, &all, &json, &paths, &end, &argtable);
+    build_ls_argtable(&help, &all, &json, &paths, &end, tbl);
 
     fprintf(out, "Usage: ls ");
-    arg_print_syntax(out, argtable, "\n");
+    arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nList directory contents.\n\nOptions:\n");
-    arg_print_glossary(out, argtable, "  %-22s %s\n");
+    arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(argtable, 5);
+    arg_freetable(tbl, 5);
 }
 
 /* --------------------------------------------------------------------------
- * run  (skeleton — filesystem logic to be added in next step)
+ * run
  * -------------------------------------------------------------------------- */
 
-int ls_run(int argc, char **argv)
+int ls_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 {
+    (void)in_stream;   /* ls never reads input */
+
     struct arg_lit  *help;
     struct arg_lit  *all;
     struct arg_lit  *json;
     struct arg_file *paths;
     struct arg_end  *end;
-    void           **argtable;
+    void            *tbl[6];
 
-    build_ls_argtable(&help, &all, &json, &paths, &end, &argtable);
+    build_ls_argtable(&help, &all, &json, &paths, &end, tbl);
 
-    int nerrors = arg_parse(argc, argv, argtable);
+    int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
-        ls_print_usage(stdout);
-        arg_freetable(argtable, 5);
+        ls_print_usage(out_stream);
+        arg_freetable(tbl, 5);
         return 0;
     }
 
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "ls");
         fprintf(stderr, "Try 'ls --help' for more information.\n");
-        arg_freetable(argtable, 5);
+        arg_freetable(tbl, 5);
         return 1;
     }
 
@@ -200,7 +199,7 @@ int ls_run(int argc, char **argv)
 
     int multi = (n > 1);   /* print header per directory when listing several */
 
-    if (use_json && multi) printf("[\n");
+    if (use_json && multi) fprintf(out_stream, "[\n");
 
     int json_first = 1;
     for (int i = 0; i < n; i++) {
@@ -214,26 +213,26 @@ int ls_run(int argc, char **argv)
         }
 
         if (use_json && multi) {
-            if (!json_first) printf(",\n");
+            if (!json_first) fprintf(out_stream, ",\n");
             json_first = 0;
         }
 
         if (S_ISDIR(st.st_mode)) {
             if (multi && !use_json)
-                printf("%s:\n", p);
-            ret |= use_json ? list_dir_json(p, show_all)
-                            : list_dir_plain(p, show_all);
+                fprintf(out_stream, "%s:\n", p);
+            ret |= use_json ? list_dir_json(out_stream, p, show_all)
+                            : list_dir_plain(out_stream, p, show_all);
             if (multi && !use_json && i + 1 < n)
-                printf("\n");
+                fprintf(out_stream, "\n");
         } else {
-            ret |= use_json ? list_file_json(p)
-                            : list_file_plain(p);
+            ret |= use_json ? list_file_json(out_stream, p)
+                            : list_file_plain(out_stream, p);
         }
     }
 
-    if (use_json && multi) printf("]\n");
+    if (use_json && multi) fprintf(out_stream, "]\n");
 
-    arg_freetable(argtable, 5);
+    arg_freetable(tbl, 5);
     return ret;
 }
 
