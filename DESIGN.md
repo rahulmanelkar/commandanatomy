@@ -176,26 +176,29 @@ The root Makefile lists only the original five apps explicitly (it predates the 
 
 ### Architecture
 
-`mysh` is a single-file shell (`mysh.c`, ~475 lines). Its main loop:
+`mysh` is a single-file shell (`mysh.c`, ~530 lines). Its main loop:
 
-1. Print prompt if interactive
-2. `fgets` one line
-3. Tokenize via `tok_split`
-4. Parse pipeline stages via `parse_pipeline`
-5. Handle built-ins (`cd`, `exit`, `help`) for single-stage commands
-6. Execute via `run_pipeline`
+1. Reap finished background jobs with `waitpid(-1, NULL, WNOHANG)`
+2. Print prompt if interactive
+3. `fgets` one line
+4. Tokenize via `tok_split` (expands `$VAR`/`${VAR}`/`$?` in place)
+5. Strip a trailing `&` token and set a `bg` flag if present
+6. Parse pipeline stages via `parse_pipeline`
+7. Handle built-ins (`cd`, `exit`, `help`, `VAR=value`) for single-stage commands
+8. Execute via `run_pipeline`; if `bg`, fork the whole pipeline and continue
 
 ### Tokenizer (`tok.c`)
 
-`tok_split` is a hand-written state machine that recognises:
+`tok_split(line, out, last_status)` is a hand-written state machine that recognises:
 
 - **Whitespace word boundaries** — consecutive whitespace collapses
-- **Single quoting** `'...'` — contents taken literally, no escapes
-- **Double quoting** `"..."` — `\"`, `\\`, `\$` are unescaped; other characters taken literally (no variable expansion)
-- **Operators** `<`, `>`, `>>`, `|` — always emitted as their own tokens, even adjacent to words (e.g. `foo>bar` produces three tokens)
+- **Single quoting** `'...'` — contents taken literally, no escapes, no variable expansion
+- **Double quoting** `"..."` — `\"`, `\\`, `\$` are unescaped; `$VAR`/`${VAR}`/`$?` are expanded; other characters taken literally
+- **Variable expansion** `$VAR`, `${VAR}`, `$?` — resolved via `getenv()` in both normal and double-quote modes; `$?` uses the `last_status` parameter; an unrecognised bare `$` is emitted literally
+- **Operators** `<`, `>`, `>>`, `|`, `&` — always emitted as their own tokens, even adjacent to words
 - **Comments** — `#` outside a word or quote starts a comment; rest of line is discarded
 
-Result is a `tok_t` struct containing up to `TOK_MAX` (128) heap-allocated word strings. The caller frees with `tok_free()`.
+Result is a `tok_t` struct containing up to `TOK_MAX` (128) heap-allocated word strings, with all variable references already expanded. The caller frees with `tok_free()`.
 
 ### Pipeline parsing
 
@@ -270,18 +273,26 @@ When `mysh` is invoked with stdin as a pipe or redirect (not a tty and not a nam
 
 The fix: at startup, `dup(STDIN_FILENO)` to `g_cmd_fd` and read commands from `fdopen(g_cmd_fd, "r")`. Fd 0 is left untouched. Every fork child immediately calls `close(g_cmd_fd)` before doing anything else, so the shell retains sole ownership of the command stream.
 
+### Background execution
+
+When a command line ends with `&`, the shell forks the entire `run_pipeline` call into a background child process, prints `[bg] PID`, sets `last_status = 0`, and immediately returns to the prompt. The background child runs the pipeline (whether internal threads or forked external commands) synchronously and then exits.
+
+Background children inherit `SIGINT = SIG_IGN` from the shell (appropriate for non-interactive background jobs). The shell calls `waitpid(-1, NULL, WNOHANG)` at the top of every main-loop iteration to silently reap any background child that has finished, preventing zombie accumulation.
+
 ### Signal handling
 
 - The shell process ignores `SIGINT` and `SIGPIPE`.
-- Forked children restore `SIGINT` and `SIGPIPE` to `SIG_DFL` before executing. This means Ctrl-C kills foreground children but not the shell itself, and broken pipes in pipeline children terminate normally.
+- Forked foreground children restore `SIGINT` and `SIGPIPE` to `SIG_DFL` before executing. This means Ctrl-C kills foreground children but not the shell itself, and broken pipes in pipeline children terminate normally.
+- Background children inherit `SIGINT = SIG_IGN` (the shell's disposition) and are reaped non-blocking at the top of each prompt loop.
 
 ### Built-in commands
 
-Three built-ins must run in the shell process itself (not forkable):
+Four built-ins must run in the shell process itself (not forkable):
 
 - **`cd [DIR]`** — calls `chdir`. Updates `OLDPWD` before changing; `cd -` reads `OLDPWD` and prints the destination (matching bash behaviour). `cd` with no argument uses `$HOME`.
 - **`exit [N]`** — exits with `N`, or with `last_status` if no argument.
 - **`help`** — calls `reg_print_all()` to list all registered commands with their summaries, plus the built-in list.
+- **`VAR=value`** — if the sole token on a line matches `[A-Za-z_][A-Za-z0-9_]*=...`, the shell calls `setenv(name, value, 1)`. Because `setenv` modifies the process environment, the new variable is immediately visible to all subsequent commands (including `$VAR` expansion in the tokenizer and child processes that inherit the environment).
 
 ### PATH integration
 
@@ -417,7 +428,7 @@ These are generous enough for all real use cases and avoid the complexity of dyn
 A Bash test runner at the repo root covers all apps and the shell's pipeline executor:
 
 ```sh
-./test_apps.sh                    # run all 36 tests
+./test_apps.sh                    # run all 43 tests
 ./test_apps.sh --test N           # run a specific test by number
 ./test_apps.sh --test N --test M  # run multiple specific tests
 ```
@@ -428,6 +439,20 @@ The runner has two execution modes:
 - **`run_mysh`** — writes a pipeline string to a temp script file and runs it through `mysh`. Displays the pipeline string (not the script path) so the log is readable.
 
 Exit code is 0 if all selected tests pass, 1 otherwise — suitable for use in a CI script.
+
+### BNF shell lab tests (37–43)
+
+Tests 37–43 cover the grammar-level features added in the BNF shell lab session:
+
+| Test | What it exercises |
+|---|---|
+| 37 | `VAR=value` assignment, then `$VAR` expansion |
+| 38 | `${VAR}` braced form inside double quotes |
+| 39 | `$?` is 0 after a successful command |
+| 40 | `$?` reflects a non-zero exit code (grep no match = 1) |
+| 41 | Single-quoted `'$X'` is emitted literally, not expanded |
+| 42 | `sleep 5 &` completes in < 3 s (non-blocking); output contains `[bg] PID` |
+| 43 | `$VAR` expanded as an argument inside a pipeline (`grep $PATTERN`) |
 
 ### Thread-safety verification
 

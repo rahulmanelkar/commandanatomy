@@ -90,7 +90,7 @@ Each app produces a standalone binary (e.g. `apps/ls/ls`) and a static library (
 `test_apps.sh` is a manual test runner that exercises every app and the shell's pipeline executor. Run it from the repo root after building:
 
 ```sh
-./test_apps.sh                          # run all 36 tests
+./test_apps.sh                          # run all 43 tests
 ./test_apps.sh --test 1                 # run a single test by number
 ./test_apps.sh --test 1 --test 2        # run multiple specific tests
 ```
@@ -130,6 +130,7 @@ A summary line is printed at the end and the script exits non-zero if any test f
 | 27–28 | `cut` — field extraction, character range |
 | 29 | `tee` — stdout passthrough + file write verified |
 | 30–36 | Pipelines — 2- through 6-stage concurrent thread pipelines through `mysh` |
+| 37–43 | BNF shell lab — `VAR=value` assignment, `$VAR`/`${VAR}`/`$?` expansion, single-quote suppression, `&` background, `$VAR` as pipeline argument |
 
 Test 33 specifically targets the thread-safety fix for `sort`: it runs two `sort` stages concurrently in the same pipeline (`cat | sort | uniq -c | sort -rn`) and verifies they produce correct output despite sharing the same process address space.
 
@@ -709,7 +710,10 @@ The prompt shows the last exit code when non-zero: `mysh [1]> `.
 | Output redirection | `ls > out.txt` |
 | Append redirection | `echo "line" >> log.txt` |
 | Pipelines | `ls \| sort \| wc -l` |
-| Single and double quoting | `echo 'hello world'`, `echo "hi $USER"` |
+| Variable assignment | `NAME=Alice` — sets an environment variable in the shell |
+| Variable expansion | `echo $NAME`, `echo ${NAME}`, `echo $?` (last exit status) |
+| Single and double quoting | `echo 'literal $X'` (no expansion), `echo "hello $NAME"` (expands) |
+| Background execution | `sleep 10 &` — runs in background, prints `[bg] PID`, shell continues |
 | Comments | `# this line is ignored` |
 | Script files | `mysh deploy.sh` |
 
@@ -813,6 +817,22 @@ mysh> cat apps/hello/hello_main.c | wc -l
 
 mysh> wc -l < apps/pkg/cmd_pkg.c
      708 apps/pkg/cmd_pkg.c
+
+mysh> NAME=world
+mysh> echo "Hello $NAME"
+Hello world
+
+mysh> PATTERN=include
+mysh> grep $PATTERN apps/cat/cmd_cat.c | wc -l
+5
+
+mysh> echo $?
+0
+
+mysh> sleep 10 &
+[bg] 12345
+mysh> echo "shell continues immediately"
+shell continues immediately
 
 mysh> cd /tmp && pwd
 /tmp
