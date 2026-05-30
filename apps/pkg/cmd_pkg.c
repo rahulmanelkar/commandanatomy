@@ -1,15 +1,3 @@
-/*
- * pkg — package manager for mysh
- *
- * Subcommands:
- *   build   <src-dir> <output.tar.gz>   pack a directory into a package
- *   install <pkg.tar.gz>                install a package under ~/.mysh
- *   list                                list installed packages
- *   remove  <name>                      remove an installed package
- */
-
-#define _POSIX_C_SOURCE 200809L
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,21 +8,17 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
-/* ── constants ──────────────────────────────────────────────────────────── */
+#include "argtable3.h"
+#include "cmd_spec.h"
+
+/* ── constants ───────────────────────────────────────────────────────────── */
 
 #define MAX_BINS      32
 #define MAX_BIN_LEN  256
 #define MAX_FIELD    128
-/* Buffers that hold a full path plus appended components must be larger. */
 #define PATHBUF     8192
 
-/* ── types ──────────────────────────────────────────────────────────────── */
-
-typedef struct {
-    const char *name;
-    int (*fn)(int argc, char **argv);
-    const char *usage;
-} subcmd_t;
+/* ── types ───────────────────────────────────────────────────────────────── */
 
 typedef struct {
     char name[MAX_FIELD];
@@ -43,24 +27,59 @@ typedef struct {
     int  nbin;
 } pkg_meta_t;
 
-/* ── forward declarations ───────────────────────────────────────────────── */
+/* ── argtable3 builders ──────────────────────────────────────────────────── */
 
-static int cmd_build(int argc, char **argv);
-static int cmd_install(int argc, char **argv);
-static int cmd_list(int argc, char **argv);
-static int cmd_remove(int argc, char **argv);
+static void build_build_argtable(
+    struct arg_lit **help,
+    struct arg_str **src,
+    struct arg_str **output,
+    struct arg_end **end,
+    void **tbl)          /* caller allocates: void *tbl[5] */
+{
+    *help   = arg_lit0("h", "help", "show this help and exit");
+    *src    = arg_str1(NULL, NULL, "<src-dir>",       "directory to pack");
+    *output = arg_str1(NULL, NULL, "<output.tar.gz>", "output archive path");
+    *end    = arg_end(20);
+    tbl[0] = *help; tbl[1] = *src; tbl[2] = *output; tbl[3] = *end; tbl[4] = NULL;
+}
 
-/* ── dispatch table ─────────────────────────────────────────────────────── */
+static void build_install_argtable(
+    struct arg_lit **help,
+    struct arg_str **archive,
+    struct arg_end **end,
+    void **tbl)          /* caller allocates: void *tbl[4] */
+{
+    *help    = arg_lit0("h", "help", "show this help and exit");
+    *archive = arg_str1(NULL, NULL, "<pkg.tar.gz>", "package archive to install");
+    *end     = arg_end(20);
+    tbl[0] = *help; tbl[1] = *archive; tbl[2] = *end; tbl[3] = NULL;
+}
 
-static const subcmd_t commands[] = {
-    { "build",   cmd_build,   "pkg build <src-dir> <output.tar.gz>" },
-    { "install", cmd_install, "pkg install <pkg.tar.gz>"            },
-    { "list",    cmd_list,    "pkg list"                            },
-    { "remove",  cmd_remove,  "pkg remove <name>"                   },
-};
-static const int NUM_COMMANDS = (int)(sizeof commands / sizeof *commands);
+static void build_list_argtable(
+    struct arg_lit **help,
+    struct arg_end **end,
+    void **tbl)          /* caller allocates: void *tbl[3] */
+{
+    *help = arg_lit0("h", "help", "show this help and exit");
+    *end  = arg_end(20);
+    tbl[0] = *help; tbl[1] = *end; tbl[2] = NULL;
+}
 
-/* ── generic helpers ────────────────────────────────────────────────────── */
+static void build_remove_argtable(
+    struct arg_lit **help,
+    struct arg_str **name,
+    struct arg_str **version,
+    struct arg_end **end,
+    void **tbl)          /* caller allocates: void *tbl[5] */
+{
+    *help    = arg_lit0("h", "help", "show this help and exit");
+    *name    = arg_str1(NULL, NULL, "<name>",    "package name");
+    *version = arg_str0(NULL, NULL, "[version]", "specific version to remove (default: latest)");
+    *end     = arg_end(20);
+    tbl[0] = *help; tbl[1] = *name; tbl[2] = *version; tbl[3] = *end; tbl[4] = NULL;
+}
+
+/* ── generic helpers ─────────────────────────────────────────────────────── */
 
 static int run_command(char *const argv[])
 {
@@ -76,16 +95,6 @@ static int run_command(char *const argv[])
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-static void usage(const char *prog)
-{
-    fprintf(stderr, "Usage: %s <subcommand> [args]\n\n", prog);
-    fprintf(stderr, "Subcommands:\n");
-    for (int i = 0; i < NUM_COMMANDS; i++)
-        fprintf(stderr, "  %s\n", commands[i].usage);
-}
-
-/* ── path helpers ───────────────────────────────────────────────────────── */
-
 static char *expand_home(const char *path, char *buf, size_t size)
 {
     if (path[0] != '~') {
@@ -99,7 +108,6 @@ static char *expand_home(const char *path, char *buf, size_t size)
     return (n > 0 && (size_t)n < size) ? buf : NULL;
 }
 
-/* mkdir -p: creates every component in path, ignores EEXIST. */
 static int mkdirs(const char *path)
 {
     char tmp[4096];
@@ -120,10 +128,6 @@ static int mkdirs(const char *path)
     return 0;
 }
 
-/*
- * Find the first subdirectory inside dir and write its name (not full path)
- * into out.  Returns 0 on success, -1 if none found.
- */
 static int find_first_subdir(const char *dir, char *out, size_t out_size)
 {
     DIR *d = opendir(dir);
@@ -145,12 +149,8 @@ static int find_first_subdir(const char *dir, char *out, size_t out_size)
     return -1;
 }
 
-/* ── minimal JSON helpers ───────────────────────────────────────────────── */
+/* ── minimal JSON helpers ────────────────────────────────────────────────── */
 
-/*
- * Extract the first string value for key from a flat JSON object.
- * Handles basic backslash escapes.  Returns 1 on success, 0 if not found.
- */
 static int json_get_string(const char *json, const char *key,
                            char *out, size_t out_size)
 {
@@ -172,10 +172,6 @@ static int json_get_string(const char *json, const char *key,
     return 1;
 }
 
-/*
- * Extract an array of strings for key from a flat JSON object.
- * Fills bins[0..max-1][MAX_BIN_LEN].  Returns the number of entries found.
- */
 static int json_get_string_array(const char *json, const char *key,
                                  char bins[][MAX_BIN_LEN], int max)
 {
@@ -209,19 +205,49 @@ static int json_get_string_array(const char *json, const char *key,
     return count;
 }
 
-/* ── subcommands ────────────────────────────────────────────────────────── */
+/* ── subcommand helpers ──────────────────────────────────────────────────── */
 
-static int cmd_build(int argc, char **argv)
+static void print_subcmd_usage(FILE *out, const char *sub,
+                               void **tbl, const char *desc)
 {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s\n", commands[0].usage);
+    fprintf(out, "Usage: pkg %s ", sub);
+    arg_print_syntax(out, tbl, "\n");
+    fprintf(out, "\n%s\n\nOptions:\n", desc);
+    arg_print_glossary(out, tbl, "  %-26s %s\n");
+}
+
+/* ── subcommands ─────────────────────────────────────────────────────────── */
+
+static int cmd_build(int argc, char **argv, FILE *out_stream)
+{
+    struct arg_lit *help;
+    struct arg_str *src, *output;
+    struct arg_end *end;
+    void *tbl[5];
+    build_build_argtable(&help, &src, &output, &end, tbl);
+
+    /* Parse from argv+1 so argtable sees "build" as argv[0] */
+    int nerrors = arg_parse(argc - 1, argv + 1, tbl);
+
+    if (help->count > 0) {
+        print_subcmd_usage(out_stream, "build", tbl,
+                           "Pack a directory into a .tar.gz package archive.");
+        arg_freetable(tbl, 4);
+        return 0;
+    }
+    if (nerrors > 0) {
+        arg_print_errors(stderr, end, "pkg build");
+        fprintf(stderr, "Try 'pkg build --help' for more information.\n");
+        arg_freetable(tbl, 4);
         return 1;
     }
-    const char *src    = argv[2];
-    const char *output = argv[3];
+
+    const char *src_path    = src->sval[0];
+    const char *output_path = output->sval[0];
+    arg_freetable(tbl, 4);
 
     char src_copy[4096];
-    if ((size_t)snprintf(src_copy, sizeof src_copy, "%s", src) >= sizeof src_copy) {
+    if ((size_t)snprintf(src_copy, sizeof src_copy, "%s", src_path) >= sizeof src_copy) {
         fprintf(stderr, "pkg build: path too long\n");
         return 1;
     }
@@ -240,36 +266,46 @@ static int cmd_build(int argc, char **argv)
         snprintf(base, sizeof base, "%s", src_copy);
     }
 
-    char *tar_argv[] = { "tar", "-czf", (char *)output, "-C", parent, base, NULL };
-    printf("pkg build: packing '%s' → %s\n", src, output);
+    char *tar_argv[] = { "tar", "-czf", (char *)output_path, "-C", parent, base, NULL };
+    fprintf(out_stream, "pkg build: packing '%s' → %s\n", src_path, output_path);
     int rc = run_command(tar_argv);
     if (rc != 0)
         fprintf(stderr, "pkg build: tar exited with status %d\n", rc);
     return rc;
 }
 
-/*
- * pkg install <archive.tar.gz>
- *
- * 1. Extract archive to a mkdtemp scratch directory.
- * 2. Read and parse the top-level pkg.json (name, version, bin[]).
- * 3. Move the extracted tree to ~/.mysh/pkgs/<name>-<version>/.
- * 4. Symlink each listed binary into ~/.mysh/bin/.
- */
-static int cmd_install(int argc, char **argv)
+static int cmd_install(int argc, char **argv, FILE *out_stream)
 {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s\n", commands[1].usage);
+    struct arg_lit *help;
+    struct arg_str *archive;
+    struct arg_end *end;
+    void *tbl[4];
+    build_install_argtable(&help, &archive, &end, tbl);
+
+    int nerrors = arg_parse(argc - 1, argv + 1, tbl);
+
+    if (help->count > 0) {
+        print_subcmd_usage(out_stream, "install", tbl,
+                           "Install a package archive under ~/.mysh/pkgs/ and\n"
+                           "symlink its declared binaries into ~/.mysh/bin/.");
+        arg_freetable(tbl, 3);
+        return 0;
+    }
+    if (nerrors > 0) {
+        arg_print_errors(stderr, end, "pkg install");
+        fprintf(stderr, "Try 'pkg install --help' for more information.\n");
+        arg_freetable(tbl, 3);
         return 1;
     }
-    const char *archive = argv[2];
 
-    /* ── step 1: extract to scratch dir ─────────────────────────────────── */
+    const char *archive_path = archive->sval[0];
+    arg_freetable(tbl, 3);
 
+    /* Extract to scratch dir */
     char tmpdir[] = "/tmp/pkg-XXXXXX";
     if (!mkdtemp(tmpdir)) { perror("mkdtemp"); return 1; }
 
-    char *untar[] = { "tar", "-xzf", (char *)archive, "-C", tmpdir, NULL };
+    char *untar[] = { "tar", "-xzf", (char *)archive_path, "-C", tmpdir, NULL };
     if (run_command(untar) != 0) {
         fprintf(stderr, "pkg install: extraction failed\n");
         char *rm[] = { "rm", "-rf", tmpdir, NULL };
@@ -277,8 +313,7 @@ static int cmd_install(int argc, char **argv)
         return 1;
     }
 
-    /* ── step 2: locate the top-level dir the archive unpacked into ──────── */
-
+    /* Locate the top-level dir the archive unpacked into */
     char subdir[256];
     if (find_first_subdir(tmpdir, subdir, sizeof subdir) < 0) {
         fprintf(stderr, "pkg install: no directory found in archive\n");
@@ -289,8 +324,7 @@ static int cmd_install(int argc, char **argv)
     char extracted[4096];
     snprintf(extracted, sizeof extracted, "%s/%s", tmpdir, subdir);
 
-    /* ── step 3: parse pkg.json ──────────────────────────────────────────── */
-
+    /* Parse pkg.json */
     char json_path[PATHBUF];
     snprintf(json_path, sizeof json_path, "%s/pkg.json", extracted);
     FILE *f = fopen(json_path, "r");
@@ -334,8 +368,7 @@ static int cmd_install(int argc, char **argv)
     meta.nbin = json_get_string_array(json, "bin", meta.bins, MAX_BINS);
     free(json);
 
-    /* ── step 4: compute install paths ──────────────────────────────────── */
-
+    /* Compute install paths */
     char pkgs_root[4096], install_dir[PATHBUF], bin_dir[4096];
     if (!expand_home("~/.mysh/pkgs", pkgs_root, sizeof pkgs_root) ||
         !expand_home("~/.mysh/bin",  bin_dir,   sizeof bin_dir)) {
@@ -360,13 +393,8 @@ static int cmd_install(int argc, char **argv)
         return 1;
     }
 
-    /* ── step 5: move extracted tree to final location ───────────────────── */
-
+    /* Move to final location; fall back to cp+rm across filesystems */
     if (rename(extracted, install_dir) < 0) {
-        /*
-         * rename(2) fails with EXDEV when src and dest are on different
-         * filesystems (e.g. /tmp is a tmpfs).  Fall back to cp + rm.
-         */
         if (errno == EXDEV) {
             char *cp[] = { "cp", "-r", extracted, install_dir, NULL };
             if (run_command(cp) != 0) {
@@ -386,38 +414,48 @@ static int cmd_install(int argc, char **argv)
     char *rm_tmp[] = { "rm", "-rf", tmpdir, NULL };
     run_command(rm_tmp);
 
-    printf("pkg install: installed %s-%s\n           → %s\n",
-           meta.name, meta.version, install_dir);
+    fprintf(out_stream, "pkg install: installed %s-%s\n           → %s\n",
+            meta.name, meta.version, install_dir);
 
-    /* ── step 6: symlink binaries into ~/.mysh/bin/ ──────────────────────── */
-
+    /* Symlink binaries into ~/.mysh/bin/ */
     for (int i = 0; i < meta.nbin; i++) {
-        /* install_dir < 4096 + 2*MAX_FIELD in practice; target fits in PATHBUF */
         char link_path[PATHBUF];
         char target[PATHBUF + MAX_BIN_LEN];
         snprintf(link_path, sizeof link_path, "%s/%s", bin_dir, meta.bins[i]);
         snprintf(target,    sizeof target,    "%s/%s", install_dir, meta.bins[i]);
-
-        unlink(link_path);   /* remove stale symlink if present */
+        unlink(link_path);
         if (symlink(target, link_path) < 0)
             fprintf(stderr, "pkg install: symlink %s: %s\n",
                     meta.bins[i], strerror(errno));
         else
-            printf("pkg install: linked  %s/%s\n", bin_dir, meta.bins[i]);
+            fprintf(out_stream, "pkg install: linked  %s/%s\n", bin_dir, meta.bins[i]);
     }
 
     return 0;
 }
 
-/*
- * pkg list
- *
- * Enumerate ~/.mysh/pkgs/ — each subdirectory is an installed package.
- * Read its pkg.json to show name, version, and description if available.
- */
-static int cmd_list(int argc, char **argv)
+static int cmd_list(int argc, char **argv, FILE *out_stream)
 {
-    (void)argc; (void)argv;
+    struct arg_lit *help;
+    struct arg_end *end;
+    void *tbl[3];
+    build_list_argtable(&help, &end, tbl);
+
+    int nerrors = arg_parse(argc - 1, argv + 1, tbl);
+
+    if (help->count > 0) {
+        print_subcmd_usage(out_stream, "list", tbl,
+                           "List all packages installed under ~/.mysh/pkgs/.");
+        arg_freetable(tbl, 2);
+        return 0;
+    }
+    if (nerrors > 0) {
+        arg_print_errors(stderr, end, "pkg list");
+        fprintf(stderr, "Try 'pkg list --help' for more information.\n");
+        arg_freetable(tbl, 2);
+        return 1;
+    }
+    arg_freetable(tbl, 2);
 
     char pkgs_root[4096];
     if (!expand_home("~/.mysh/pkgs", pkgs_root, sizeof pkgs_root)) {
@@ -428,7 +466,7 @@ static int cmd_list(int argc, char **argv)
     DIR *d = opendir(pkgs_root);
     if (!d) {
         if (errno == ENOENT) {
-            printf("No packages installed.\n");
+            fprintf(out_stream, "No packages installed.\n");
             return 0;
         }
         fprintf(stderr, "pkg list: %s: %s\n", pkgs_root, strerror(errno));
@@ -445,7 +483,6 @@ static int cmd_list(int argc, char **argv)
         struct stat st;
         if (stat(pkg_dir, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
 
-        /* Try to read pkg.json for description */
         char json_path[PATHBUF + 16];
         snprintf(json_path, sizeof json_path, "%s/pkg.json", pkg_dir);
         char desc[256] = "";
@@ -465,31 +502,44 @@ static int cmd_list(int argc, char **argv)
         }
 
         if (desc[0])
-            printf("  %-30s  %s\n", ent->d_name, desc);
+            fprintf(out_stream, "  %-30s  %s\n", ent->d_name, desc);
         else
-            printf("  %s\n", ent->d_name);
+            fprintf(out_stream, "  %s\n", ent->d_name);
         found++;
     }
     closedir(d);
 
     if (!found)
-        printf("No packages installed.\n");
+        fprintf(out_stream, "No packages installed.\n");
     return 0;
 }
 
-/*
- * pkg remove <name>           — remove newest version
- * pkg remove <name> <version> — remove specific version
- *
- * Deletes ~/.mysh/pkgs/<name>-<version>/ and unlinks any ~/.mysh/bin/
- * symlinks that resolve into that directory.
- */
-static int cmd_remove(int argc, char **argv)
+static int cmd_remove(int argc, char **argv, FILE *out_stream)
 {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s\n", commands[3].usage);
+    struct arg_lit *help;
+    struct arg_str *name, *version;
+    struct arg_end *end;
+    void *tbl[5];
+    build_remove_argtable(&help, &name, &version, &end, tbl);
+
+    int nerrors = arg_parse(argc - 1, argv + 1, tbl);
+
+    if (help->count > 0) {
+        print_subcmd_usage(out_stream, "remove", tbl,
+                           "Remove an installed package and its bin/ symlinks.");
+        arg_freetable(tbl, 4);
+        return 0;
+    }
+    if (nerrors > 0) {
+        arg_print_errors(stderr, end, "pkg remove");
+        fprintf(stderr, "Try 'pkg remove --help' for more information.\n");
+        arg_freetable(tbl, 4);
         return 1;
     }
+
+    const char *pkg_name = name->sval[0];
+    const char *pkg_ver  = version->count > 0 ? version->sval[0] : NULL;
+    arg_freetable(tbl, 4);
 
     char pkgs_root[4096], bin_dir[4096];
     if (!expand_home("~/.mysh/pkgs", pkgs_root, sizeof pkgs_root) ||
@@ -498,25 +548,20 @@ static int cmd_remove(int argc, char **argv)
         return 1;
     }
 
-    const char *name = argv[2];
     char install_dir[PATHBUF];
 
-    if (argc >= 4) {
-        /* explicit version */
+    if (pkg_ver) {
         snprintf(install_dir, sizeof install_dir, "%s/%s-%s",
-                 pkgs_root, name, argv[3]);
+                 pkgs_root, pkg_name, pkg_ver);
     } else {
-        /*
-         * No version given — scan pkgs_root for entries matching "<name>-*"
-         * and pick the lexicographically last one (good enough for semver).
-         */
+        /* Scan for entries matching "<name>-*", pick lexicographically last */
         DIR *d = opendir(pkgs_root);
         if (!d) {
             fprintf(stderr, "pkg remove: %s: %s\n", pkgs_root, strerror(errno));
             return 1;
         }
         char prefix[MAX_FIELD + 2];
-        snprintf(prefix, sizeof prefix, "%s-", name);
+        snprintf(prefix, sizeof prefix, "%s-", pkg_name);
         size_t plen = strlen(prefix);
 
         char best[256] = "";
@@ -533,20 +578,19 @@ static int cmd_remove(int argc, char **argv)
         closedir(d);
 
         if (best[0] == '\0') {
-            fprintf(stderr, "pkg remove: '%s' is not installed\n", name);
+            fprintf(stderr, "pkg remove: '%s' is not installed\n", pkg_name);
             return 1;
         }
         snprintf(install_dir, sizeof install_dir, "%s/%s", pkgs_root, best);
     }
 
-    /* Verify the directory exists */
     struct stat st;
     if (stat(install_dir, &st) < 0) {
         fprintf(stderr, "pkg remove: %s: %s\n", install_dir, strerror(errno));
         return 1;
     }
 
-    /* Remove any bin/ symlinks that point into install_dir */
+    /* Remove bin/ symlinks that point into install_dir */
     DIR *bd = opendir(bin_dir);
     if (bd) {
         struct dirent *ent;
@@ -560,32 +604,105 @@ static int cmd_remove(int argc, char **argv)
             target[n] = '\0';
             if (strncmp(target, install_dir, strlen(install_dir)) == 0) {
                 if (unlink(link_path) == 0)
-                    printf("pkg remove: unlinked  %s\n", link_path);
+                    fprintf(out_stream, "pkg remove: unlinked  %s\n", link_path);
             }
         }
         closedir(bd);
     }
 
-    /* Delete the package directory tree */
     char *rm[] = { "rm", "-rf", install_dir, NULL };
     if (run_command(rm) != 0) {
         fprintf(stderr, "pkg remove: failed to remove %s\n", install_dir);
         return 1;
     }
-    printf("pkg remove: removed %s\n", install_dir);
+    fprintf(out_stream, "pkg remove: removed %s\n", install_dir);
     return 0;
 }
 
-/* ── main ───────────────────────────────────────────────────────────────── */
+/* ── print_usage ─────────────────────────────────────────────────────────── */
 
-int main(int argc, char **argv)
+void pkg_print_usage(FILE *out)
 {
-    if (argc < 2) { usage(argv[0]); return 1; }
+    fprintf(out, "Usage: pkg <subcommand> [options]\n\n");
+    fprintf(out, "A local package manager for mysh extensions.\n");
+    fprintf(out, "Packages install under ~/.mysh/pkgs/ with binaries symlinked\n");
+    fprintf(out, "into ~/.mysh/bin/ (auto-added to PATH by mysh on startup).\n\n");
+    fprintf(out, "Subcommands:\n");
+
+    {
+        struct arg_lit *help; struct arg_str *src, *output; struct arg_end *end;
+        void *tbl[5];
+        build_build_argtable(&help, &src, &output, &end, tbl);
+        fprintf(out, "\n  pkg build ");
+        arg_print_syntax(out, tbl, "\n");
+        fprintf(out, "    Pack a directory into a .tar.gz package archive.\n");
+        arg_freetable(tbl, 4);
+    }
+    {
+        struct arg_lit *help; struct arg_str *archive; struct arg_end *end;
+        void *tbl[4];
+        build_install_argtable(&help, &archive, &end, tbl);
+        fprintf(out, "\n  pkg install ");
+        arg_print_syntax(out, tbl, "\n");
+        fprintf(out, "    Install a package; symlink its binaries into ~/.mysh/bin/.\n");
+        arg_freetable(tbl, 3);
+    }
+    {
+        struct arg_lit *help; struct arg_end *end;
+        void *tbl[3];
+        build_list_argtable(&help, &end, tbl);
+        fprintf(out, "\n  pkg list ");
+        arg_print_syntax(out, tbl, "\n");
+        fprintf(out, "    List installed packages with descriptions.\n");
+        arg_freetable(tbl, 2);
+    }
+    {
+        struct arg_lit *help; struct arg_str *name, *version; struct arg_end *end;
+        void *tbl[5];
+        build_remove_argtable(&help, &name, &version, &end, tbl);
+        fprintf(out, "\n  pkg remove ");
+        arg_print_syntax(out, tbl, "\n");
+        fprintf(out, "    Remove a package and its bin/ symlinks.\n");
+        arg_freetable(tbl, 4);
+    }
+
+    fprintf(out, "\nRun 'pkg <subcommand> --help' for subcommand-specific options.\n");
+}
+
+/* ── run ─────────────────────────────────────────────────────────────────── */
+
+int pkg_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
+{
+    (void)in_stream;
+
+    /* Top-level --help or no subcommand */
+    if (argc < 2 ||
+        strcmp(argv[1], "--help") == 0 ||
+        strcmp(argv[1], "-h") == 0) {
+        pkg_print_usage(out_stream);
+        return argc < 2 ? 1 : 0;
+    }
+
     const char *sub = argv[1];
-    for (int i = 0; i < NUM_COMMANDS; i++)
-        if (strcmp(sub, commands[i].name) == 0)
-            return commands[i].fn(argc, argv);
+    if (strcmp(sub, "build")   == 0) return cmd_build(argc, argv, out_stream);
+    if (strcmp(sub, "install") == 0) return cmd_install(argc, argv, out_stream);
+    if (strcmp(sub, "list")    == 0) return cmd_list(argc, argv, out_stream);
+    if (strcmp(sub, "remove")  == 0) return cmd_remove(argc, argv, out_stream);
+
     fprintf(stderr, "pkg: unknown subcommand '%s'\n", sub);
-    usage(argv[0]);
+    fprintf(stderr, "Run 'pkg --help' for available subcommands.\n");
     return 1;
 }
+
+/* ── cmd_spec_t ──────────────────────────────────────────────────────────── */
+
+cmd_spec_t cmd_pkg_spec = {
+    .name       = "pkg",
+    .summary    = "local package manager",
+    .long_help  = "Build, install, list, and remove mysh extension packages. "
+                  "Packages are .tar.gz archives with a pkg.json manifest describing "
+                  "the name, version, description, and binaries to symlink. "
+                  "Run 'pkg --help' for subcommand details.",
+    .run         = pkg_run,
+    .print_usage = pkg_print_usage,
+};

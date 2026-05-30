@@ -614,10 +614,16 @@ echo "hello world" | apps/tee/tee --json
 ### `pkg` — local package manager
 
 ```sh
-apps/pkg/pkg <subcommand> [args]
+apps/pkg/pkg <subcommand> [--help]
 ```
 
-Packages are `.tar.gz` archives containing a `pkg.json` manifest plus any files to install. They install under `~/.mysh/pkgs/<name>-<version>/` and declared binaries are symlinked into `~/.mysh/bin/`.
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit (top-level or per-subcommand) |
+
+Follows the full `cmd_spec_t` anatomy with `argtable3`. Each subcommand has its own argument definition and `--help` output. Run `apps/pkg/pkg --help` for the subcommand list; run `apps/pkg/pkg <subcommand> --help` for per-subcommand usage.
+
+Packages are `.tar.gz` archives containing a `pkg.json` manifest plus any files to install. They install under `~/.mysh/pkgs/<name>-<version>/` and declared binaries are symlinked into `~/.mysh/bin/`. `pkg` is also registered as a shell built-in, so it runs in-process inside `mysh` with no fork overhead.
 
 **`pkg.json` format:**
 
@@ -630,16 +636,22 @@ Packages are `.tar.gz` archives containing a `pkg.json` manifest plus any files 
 }
 ```
 
-| Subcommand | Description |
-|---|---|
-| `build <src-dir> <output.tar.gz>` | Pack a directory into a package archive |
-| `install <pkg.tar.gz>` | Extract and install; symlink declared binaries |
-| `list` | List installed packages with descriptions |
-| `remove <name> [version]` | Remove a package and its bin symlinks |
+| Subcommand | Usage | Description |
+|---|---|---|
+| `build` | `build <src-dir> <output.tar.gz>` | Pack a directory into a package archive |
+| `install` | `install <pkg.tar.gz>` | Extract and install; symlink declared binaries |
+| `list` | `list` | List installed packages with descriptions |
+| `remove` | `remove <name> [version]` | Remove a package and its bin symlinks |
 
 **Examples:**
 
 ```sh
+# Show all subcommands
+apps/pkg/pkg --help
+
+# Per-subcommand help
+apps/pkg/pkg build --help
+
 # Pack a directory
 apps/pkg/pkg build myapp/ myapp-1.0.0.tar.gz
 
@@ -799,8 +811,8 @@ mysh> ls apps | tee /tmp/apps.txt | wc -l
 mysh> cat apps/hello/hello_main.c | wc -l
        8
 
-mysh> wc -l < apps/pkg/pkg.c
-     591 apps/pkg/pkg.c
+mysh> wc -l < apps/pkg/cmd_pkg.c
+     708 apps/pkg/cmd_pkg.c
 
 mysh> cd /tmp && pwd
 /tmp

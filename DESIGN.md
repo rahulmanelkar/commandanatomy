@@ -353,7 +353,11 @@ Opens all output files before reading. Reads stdin in 4 KiB chunks and `fwrite`s
 
 ### `pkg` — local package manager
 
-Unlike the other apps, `pkg` does not use the `cmd_spec_t` anatomy or `argtable3`. It is a self-contained single-file program with manual `argv` dispatch. Subcommands: `build` (shells out to `tar`), `install` (shells out to `tar -xz` into `~/.mysh/pkgs/<name>-<ver>/`, then symlinks declared binaries into `~/.mysh/bin/`), `list` (scans `~/.mysh/pkgs/`), `remove` (unlinks bin symlinks, then `rm -rf`). Packages are described by a `pkg.json` manifest parsed with a minimal hand-written JSON reader (no library dependency).
+Follows the full `cmd_spec_t` anatomy. Subcommands (`build`, `install`, `list`, `remove`) are dispatched manually by inspecting `argv[1]` — subcommand names are not argtable3 options — then each subcommand parses its own arguments with a dedicated `build_<sub>_argtable()` builder. Passing `argv + 1` to `arg_parse` makes the subcommand name the effective `argv[0]` for error messages, so argtable3 errors read naturally (e.g., `pkg build: missing option <src-dir>`). Each subcommand supports `--help` independently.
+
+Subcommands: `build` (shells out to `tar -czf`), `install` (shells out to `tar -xzf` into a scratch directory, parses `pkg.json`, then moves the tree to `~/.mysh/pkgs/<name>-<ver>/` and symlinks declared binaries into `~/.mysh/bin/`; handles cross-filesystem moves via `cp` + `rm` fallback when `rename(2)` returns `EXDEV`), `list` (scans `~/.mysh/pkgs/` and reads each package's `pkg.json` for a description), `remove` (unlinks `~/.mysh/bin/` symlinks pointing into the package tree, then `rm -rf`; when no version is given, picks the lexicographically latest installed version).
+
+Packages are described by a `pkg.json` manifest parsed with a minimal hand-written JSON reader (no library dependency beyond what the rest of the project already uses).
 
 ---
 
