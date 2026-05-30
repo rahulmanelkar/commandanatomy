@@ -880,6 +880,28 @@ echo 'ls apps | wc -l' | shell/mysh
 
 ---
 
+### Note: internal vs external command execution
+
+The shell uses three execution strategies, chosen at dispatch time:
+
+- **Registered commands (no fork, no exec)** — `reg_find()` checks the in-memory registry first. If found, `spec->run()` is called directly with explicit `FILE*` streams, either on the main thread (single-stage) or a `pthread_create`'d thread (pipeline stage). Current registered commands: `hello`, `ls`, `stat`, `wc`, `cat`, `echo`, `head`, `tail`, `grep`, `sort`, `uniq`, `cut`, `tee`, `pkg`.
+
+- **External commands (fork + execvp)** — if `reg_find()` returns NULL, the shell falls back to `fork()` + `execvp()`. Anything on `PATH` works: `git`, `python3`, `make`, etc.
+
+- **Background execution (fork, no exec for internal pipelines)** — when `&` is present the shell forks a child that calls `run_pipeline()` directly. If every stage is a registered command, that child never calls `exec` at all — it runs threads and exits. External stages within the same background pipeline will still `fork` + `execvp`.
+
+Both internal and external commands can be mixed freely in the same pipeline:
+
+```sh
+mysh> cat apps/cat/cmd_cat.c | python3 -c "import sys; print(len(sys.stdin.readlines()))"
+```
+
+`cat` runs as an internal thread; `python3` forks. The pipe connects them transparently.
+
+The one thing the shell cannot do is replace its own process image — there is no `exec` built-in.
+
+---
+
 ### Built-in commands
 
 | Command | Description |
