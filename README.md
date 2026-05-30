@@ -1051,6 +1051,26 @@ All other commands are looked up in PATH.
 mysh> exit
 ```
 
+### Limitations
+
+The following features are intentionally absent or not yet implemented:
+
+| Missing feature | Notes |
+|---|---|
+| Glob expansion (`*.c`, `?`) | Passed literally to the command; use external `find` or `ls` instead |
+| Command substitution (`$(cmd)`) | Not supported; chain through a variable or pipeline instead |
+| `&&` / `\|\|` conditional operators | Only `\|` (pipe) is supported; use `;` via script for sequencing |
+| `;` command separator | Each line is one command; put multiple commands on separate lines or in a script |
+| Job control (`jobs`, `fg`, `bg`) | Background jobs are fire-and-forget; no way to bring them to the foreground |
+| `exec` built-in | Cannot replace the shell process image |
+| Here-documents / here-strings | `<<EOF` and `<<<` are not recognised |
+| Arithmetic expansion (`$((expr))`) | Not supported |
+| Arrays | Only scalar environment variables |
+| Signal forwarding to background jobs | `Ctrl-C` only interrupts the foreground; background jobs run to completion |
+| Pipeline stage limit | Hard-coded at 16 stages |
+
+---
+
 ## Command Anatomy
 
 Every command in this project follows a standard module structure defined in `include/cmd_spec.h`:
@@ -1072,3 +1092,82 @@ Each module uses a shared `build_<name>_argtable()` helper — with the table al
 The `apps/hello/` module is the canonical reference implementation. It also includes `registry.c` — a minimal in-memory command registry (`registry_register`, `registry_find`, `registry_print_all`) that the shell will use for built-in dispatch.
 
 See `CommandAnatomy.ipynb` for a full walkthrough of the design.
+
+---
+
+## Adding a new command
+
+Every command follows the `cmd_spec_t` anatomy. The fastest path is to copy the `hello` reference module and modify it.
+
+**1. Copy the reference module**
+
+```sh
+cp -r apps/hello apps/mycommand
+```
+
+**2. Rename the files**
+
+```sh
+mv apps/mycommand/cmd_hello.c    apps/mycommand/cmd_mycommand.c
+mv apps/mycommand/hello_main.c   apps/mycommand/mycommand_main.c
+```
+
+**3. Implement the command in `cmd_mycommand.c`**
+
+The file must define:
+
+```c
+/* builds the argtable — called by both run() and print_usage() */
+static void build_mycommand_argtable(/* argtable3 arg structs */ ...) { ... }
+
+/* main entrypoint: parse args, do work, return exit code */
+static int mycommand_run(int argc, char **argv, FILE *in, FILE *out) { ... }
+
+/* generate --help output from the same argtable */
+static void mycommand_print_usage(FILE *out) { ... }
+
+cmd_spec_t cmd_mycommand_spec = {
+    .name        = "mycommand",
+    .summary     = "one-line description",
+    .long_help   = "longer description shown by help",
+    .run         = mycommand_run,
+    .print_usage = mycommand_print_usage,
+};
+```
+
+Use `in` / `out` instead of `stdin` / `stdout` throughout — this is what makes the command safe to run as a pipeline thread.
+
+**4. Update the Makefile**
+
+Edit `apps/mycommand/Makefile` (copied from `hello`) — change every occurrence of `hello` to `mycommand`.
+
+**5. Register the command in the shell**
+
+In `shell/mysh.c`, add two lines:
+
+```c
+/* near the top, with the other extern declarations */
+extern cmd_spec_t cmd_mycommand_spec;
+
+/* inside main(), with the other reg_register() calls */
+reg_register(&cmd_mycommand_spec);
+```
+
+**6. Wire it into the top-level build**
+
+Add a line to the root `Makefile` so `make` builds your app and links it into the shell (follow the pattern used for `hello` or `wc`).
+
+**7. Build and test**
+
+```sh
+make
+shell/mysh
+mysh> mycommand --help
+mysh> echo "hello" | mycommand
+```
+
+Add a test case to `test_apps.sh` following the existing pattern, then run:
+
+```sh
+./test_apps.sh
+```
