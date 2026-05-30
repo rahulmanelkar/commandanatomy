@@ -9,6 +9,56 @@
 
 #define WORDBUF 4096
 
+/* Expand $VAR / ${VAR} / $? at position *pp (which points to '$').
+ * Appends the expanded text into buf[0..WORDBUF-1] via *blen.
+ * On return *pp points to the last consumed character so the caller's
+ * loop p++ lands on the first unprocessed character. */
+static void do_expand(const char **pp, char *buf, int *blen, int last_status)
+{
+    const char *p = *pp;
+    p++;  /* skip '$' */
+
+    char varname[256];
+    int  vlen = 0;
+    char numbuf[32];
+    const char *val = NULL;
+
+    if (*p == '?') {
+        snprintf(numbuf, sizeof numbuf, "%d", last_status);
+        val = numbuf;
+        /* p stays at '?'; loop p++ will skip it */
+    } else if (*p == '{') {
+        p++;  /* skip '{' */
+        while (*p && *p != '}') {
+            if (vlen < 255) varname[vlen++] = *p;
+            p++;
+        }
+        varname[vlen] = '\0';
+        if (*p == '\0') p--;  /* don't advance past NUL */
+        /* p at '}'; loop p++ skips it */
+        val = getenv(varname);
+    } else if (isalpha((unsigned char)*p) || *p == '_') {
+        while (isalnum((unsigned char)*p) || *p == '_') {
+            if (vlen < 255) varname[vlen++] = *p;
+            p++;
+        }
+        varname[vlen] = '\0';
+        p--;  /* loop p++ will advance past last identifier char */
+        val = getenv(varname);
+    } else {
+        /* bare '$': emit literally, back up so current char is re-examined */
+        if (*blen < WORDBUF - 1) buf[(*blen)++] = '$';
+        p--;
+    }
+
+    if (val) {
+        for (const char *v = val; *v && *blen < WORDBUF - 1; v++)
+            buf[(*blen)++] = *v;
+    }
+
+    *pp = p;
+}
+
 static int push_word(tok_t *t, const char *buf, int len)
 {
     if (t->n >= TOK_MAX) {
@@ -23,7 +73,7 @@ static int push_word(tok_t *t, const char *buf, int len)
     return 0;
 }
 
-int tok_split(const char *line, tok_t *out)
+int tok_split(const char *line, tok_t *out, int last_status)
 {
     out->n = 0;
 
@@ -59,6 +109,10 @@ int tok_split(const char *line, tok_t *out)
             if (c == '\\' && (p[1] == '"' || p[1] == '\\' || p[1] == '$')) {
                 p++;
                 c = *p;
+                /* fall through: write escaped char literally */
+            } else if (c == '$') {
+                do_expand(&p, buf, &blen, last_status);
+                continue;
             }
             if (blen < WORDBUF - 1) buf[blen++] = c;
             continue;
@@ -82,7 +136,13 @@ int tok_split(const char *line, tok_t *out)
         if (c == '\'') { in_sq = 1; in_word = 1; continue; }
         if (c == '"')  { in_dq = 1; in_word = 1; continue; }
 
-        if (c == '>' || c == '<' || c == '|') {
+        if (c == '$') {
+            do_expand(&p, buf, &blen, last_status);
+            in_word = 1;
+            continue;
+        }
+
+        if (c == '>' || c == '<' || c == '|' || c == '&') {
             /* flush any pending word first */
             if (in_word || blen > 0) {
                 if (push_word(out, buf, blen) < 0) { tok_free(out); return -1; }

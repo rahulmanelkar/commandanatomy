@@ -20,6 +20,7 @@
 #   27-28 cut           field extraction, character range
 #   29    tee           fanout to stdout and file
 #   30-36 pipelines     2- through 6-stage concurrent thread pipelines
+#   37-43 BNF shell lab VAR=value assignment, $VAR/$?/${VAR} expansion, & background
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -102,7 +103,7 @@ run_mysh() {
     printf '%s\n' "$pipeline" > "$tmp"
 
     printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" "$num" "$desc"
-    printf "  ${DIM}[mysh]\$ %s${RST}\n" "$pipeline"
+    printf "  ${DIM}[mysh]\$ %s${RST}\n" "${pipeline//$'\n'/ ; }"
 
     local out code
     out=$("$MYSH" "$tmp" 2>&1) && code=0 || code=$?
@@ -379,8 +380,114 @@ t_36() {
     fi
 }
 
+# BNF shell lab: VAR=value, $VAR expansion, background & ──────────────────────
+
+t_37() {
+    run_mysh 37 'VAR=value assignment + $VAR expansion' \
+        "hello" \
+        $'GREETING=hello\necho $GREETING'
+}
+
+t_38() {
+    run_mysh 38 '${VAR} braced expansion inside double quotes' \
+        "Hello world" \
+        $'WORD=world\necho "Hello ${WORD}"'
+}
+
+t_39() {
+    run_mysh 39 '$? is 0 after successful command' \
+        $'ok\n0' \
+        $'echo ok\necho $?'
+}
+
+t_40() {
+    run_mysh 40 '$? reflects non-zero exit (grep no match exits 1)' \
+        "1" \
+        $'grep zzznomatch /dev/null\necho $?'
+}
+
+t_41() {
+    # Single quotes must suppress $VAR expansion inside mysh.
+    local tmp; tmp=$(mktemp /tmp/rb_XXXXXX)
+    printf "X=nope\necho '\$X'\n" > "$tmp"
+
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 41 "single-quote suppresses \$VAR expansion"
+    printf "  ${DIM}[mysh]\$ X=nope; echo '\$X'${RST}\n"
+
+    local out code
+    out=$("$MYSH" "$tmp" 2>&1) && code=0 || code=$?
+    rm -f "$tmp"
+
+    if (( code != 0 )); then
+        printf "  ${RED}FAIL${RST}  exit code %d\n" "$code"
+        N_FAIL=$(( N_FAIL + 1 ))
+    elif [[ "$out" == '$X' ]]; then
+        printf "  ${GRN}PASS${RST}\n    %s\n" "$out"
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  expected literal '\$X', got: %s\n" "$out"
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
+t_42() {
+    # Background jobs must not block the shell.  'sleep 5 &; echo after'
+    # should complete in well under 3 seconds and print [bg] PID.
+    local tmp; tmp=$(mktemp /tmp/rb_XXXXXX)
+    printf 'sleep 5 &\necho after\n' > "$tmp"
+
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 42 "background & does not block the shell"
+    printf "  ${DIM}[mysh]\$ sleep 5 &; echo after${RST}\n"
+
+    local out code
+    out=$(timeout 3 "$MYSH" "$tmp" 2>&1); code=$?
+    rm -f "$tmp"
+
+    if (( code == 124 )); then
+        printf "  ${RED}FAIL${RST}  shell blocked — timed out after 3 s\n"
+        N_FAIL=$(( N_FAIL + 1 ))
+    elif echo "$out" | grep -q '^\[bg\] [0-9]' && echo "$out" | grep -q 'after'; then
+        printf "  ${GRN}PASS${RST}\n"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  expected '[bg] PID' and 'after' in output\n"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
+t_43() {
+    # $VAR expansion used as a command argument inside a pipeline.
+    local tmp; tmp=$(mktemp /tmp/rb_XXXXXX)
+    printf 'PATTERN=apple\ncat %s | grep $PATTERN\n' "$F_FRUITS" > "$tmp"
+
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 43 "\$VAR used as argument inside a pipeline"
+    printf "  ${DIM}[mysh]\$ PATTERN=apple; cat %s | grep \$PATTERN${RST}\n" "$F_FRUITS"
+
+    local out code expected
+    out=$("$MYSH" "$tmp" 2>&1) && code=0 || code=$?
+    rm -f "$tmp"
+    expected=$'apple\napple'
+
+    if (( code != 0 )); then
+        printf "  ${RED}FAIL${RST}  exit code %d\n" "$code"
+        [[ -n "$out" ]] && printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    elif [[ "$out" == "$expected" ]]; then
+        printf "  ${GRN}PASS${RST}\n"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  output mismatch\n"
+        printf "  ${YLW}expected:${RST}\n"; printf "%s\n" "$expected" | sed 's/^/    /'
+        printf "  ${YLW}got:${RST}\n";      printf "%s\n" "$out"      | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
 # ── registry & dispatch ───────────────────────────────────────────────────────
-ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)
+ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43)
 
 # parse --test N flags; multiple --test flags accumulate
 SELECTED=()

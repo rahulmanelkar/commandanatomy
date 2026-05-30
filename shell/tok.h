@@ -15,10 +15,12 @@ typedef struct {
  *   - operators < > >> | returned as their own words
  *   - # starts a comment (rest of line ignored)
  *
+ * last_status is the most recent exit code, used to expand $?.
+ *
  * Returns 0 on success, -1 on unmatched quote.
  * On success, caller must call tok_free() when done.
  */
-int  tok_split(const char *line, tok_t *out);
+int  tok_split(const char *line, tok_t *out, int last_status);
 void tok_free(tok_t *t);
 
 #endif /* TOK_H */

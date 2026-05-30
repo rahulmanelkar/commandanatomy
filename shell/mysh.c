@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -560,6 +561,9 @@ int main(int argc, char **argv)
     char line[4096];
 
     while (1) {
+        /* Reap any finished background jobs to avoid zombies. */
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+
         /* Prompt */
         if (interactive) {
             if (last_status != 0)
@@ -577,10 +581,19 @@ int main(int argc, char **argv)
         /* Strip trailing newline */
         line[strcspn(line, "\n")] = '\0';
 
-        /* Tokenize */
+        /* Tokenize (with variable expansion) */
         tok_t tok;
-        if (tok_split(line, &tok) < 0) continue;
+        if (tok_split(line, &tok, last_status) < 0) continue;
         if (tok.n == 0) { tok_free(&tok); continue; }
+
+        /* Check for trailing '&' (background execution). */
+        int bg = 0;
+        if (tok.n > 0 && strcmp(tok.w[tok.n - 1], "&") == 0) {
+            bg = 1;
+            free(tok.w[tok.n - 1]);
+            tok.w[--tok.n] = NULL;
+            if (tok.n == 0) { tok_free(&tok); continue; }
+        }
 
         /* Parse pipeline */
         stage_t stages[PIPELINE_MAX];
@@ -593,6 +606,25 @@ int main(int argc, char **argv)
         /* ── single-stage built-ins (must run in-process) ──────────────── */
         if (nstages == 1) {
             const char *cmd = stages[0].argv[0];
+
+            /* VAR=value: environment variable assignment */
+            {
+                char *eq = strchr(stages[0].argv[0], '=');
+                if (eq && eq > stages[0].argv[0] && stages[0].argc == 1) {
+                    *eq = '\0';
+                    const char *vname = stages[0].argv[0];
+                    int valid = (isalpha((unsigned char)*vname) || *vname == '_');
+                    for (const char *vp = vname + 1; valid && *vp; vp++)
+                        if (!isalnum((unsigned char)*vp) && *vp != '_') valid = 0;
+                    if (valid) {
+                        setenv(vname, eq + 1, 1);
+                        last_status = 0;
+                        tok_free(&tok);
+                        continue;
+                    }
+                    *eq = '=';  /* restore if not a valid assignment */
+                }
+            }
 
             if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
                 int code = (stages[0].argc >= 2) ? atoi(stages[0].argv[1]) : last_status;
@@ -639,7 +671,25 @@ int main(int argc, char **argv)
         }
 
         /* ── execute ──────────────────────────────────────────────────── */
-        last_status = run_pipeline(stages, nstages);
+        if (bg) {
+            fflush(stdout);
+            fflush(stderr);
+            pid_t bg_pid = fork();
+            if (bg_pid < 0) {
+                perror("fork");
+                last_status = 1;
+            } else if (bg_pid == 0) {
+                signal(SIGINT, SIG_DFL);
+                if (g_cmd_fd >= 0) close(g_cmd_fd);
+                int rc = run_pipeline(stages, nstages);
+                exit(rc);
+            } else {
+                printf("[bg] %d\n", bg_pid);
+                last_status = 0;
+            }
+        } else {
+            last_status = run_pipeline(stages, nstages);
+        }
         tok_free(&tok);
     }
 
