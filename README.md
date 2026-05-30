@@ -717,6 +717,169 @@ The prompt shows the last exit code when non-zero: `mysh [1]> `.
 | Comments | `# this line is ignored` |
 | Script files | `mysh deploy.sh` |
 
+### Shell syntax reference
+
+#### Variable assignment
+
+```sh
+NAME=Alice
+COUNT=42
+_TEMP=hello
+```
+
+A bare word matching `VAR=value` (no spaces around `=`, a single token on the line) sets an environment variable in the shell process. The name must start with a letter or `_` and contain only letters, digits, and `_`. The assigned value is visible to all subsequent commands and child processes.
+
+```sh
+mysh> GREETING=hello
+mysh> echo $GREETING
+hello
+mysh> git commit -m "$GREETING from mysh"   # inherited by forked children
+```
+
+A token like `FOO=bar baz` is **not** an assignment — the space splits it into two tokens and the line runs as a command instead.
+
+#### Variable expansion
+
+| Syntax | Expands to |
+|--------|------------|
+| `$VAR` | Value of environment variable `VAR` |
+| `${VAR}` | Same; braces required when the name is adjacent to other text |
+| `$?` | Exit status of the last foreground command |
+
+Expansion happens during tokenisation, before the command runs. Undefined variables expand to an empty string.
+
+```sh
+mysh> HOST=db-server
+mysh> echo "connecting to ${HOST}:5432"
+connecting to db-server:5432
+
+mysh> grep pattern file.txt
+mysh> echo $?
+0                        # or 1 if no match
+
+mysh> PATTERN=include
+mysh> grep $PATTERN apps/cat/cmd_cat.c | wc -l
+5
+```
+
+`${VAR}` is needed when the name must be separated from surrounding text:
+
+```sh
+mysh> BASE=hello
+mysh> echo ${BASE}_world   # → hello_world
+mysh> echo $BASE_world     # → empty: looks up "BASE_world"
+```
+
+#### Quoting
+
+**Single quotes** — everything between `'...'` is completely literal. No `$` expansion, no backslash escapes, no special characters.
+
+```sh
+mysh> echo 'Price: $5.00 (no expansion)'
+Price: $5.00 (no expansion)
+
+mysh> echo 'tab:\t  newline:\n'   # no escape processing
+tab:\t  newline:\n
+```
+
+**Double quotes** — `$VAR`, `${VAR}`, and `$?` expand as normal. The only recognised backslash escapes are `\"`, `\\`, and `\$`; any other `\` is kept literally.
+
+```sh
+mysh> NAME=world
+mysh> echo "Hello, $NAME!"
+Hello, world!
+
+mysh> echo "A quote: \" and a dollar: \$NAME"
+A quote: " and a dollar: $NAME
+
+mysh> echo "Path: $HOME/bin"
+Path: /home/user/bin
+```
+
+**Empty quotes** — `''` and `""` produce an empty-string argument (unlike bare whitespace which produces no token):
+
+```sh
+mysh> wc -l ''       # passes an empty filename — wc will error
+mysh> echo ""        # prints a blank line
+```
+
+#### Pipelines
+
+Stages are separated by `|`. All registered commands run as concurrent POSIX threads; external commands fork. Data streams through `pipe()` connections — downstream stages start consuming before upstream stages finish.
+
+```sh
+mysh> cat apps/*/cmd_*.c | grep "^#include" | sort | uniq -c | sort -rn | head -5
+```
+
+Up to 16 stages per pipeline.
+
+#### I/O redirection
+
+| Syntax | Effect |
+|--------|--------|
+| `cmd < file` | Read stdin from `file` |
+| `cmd > file` | Write stdout to `file` (truncate) |
+| `cmd >> file` | Write stdout to `file` (append) |
+
+Redirection can be combined with pipelines — `<` applies to the first stage, `>` / `>>` to the last stage.
+
+```sh
+mysh> wc -l < apps/cat/cmd_cat.c
+mysh> grep include apps/cat/cmd_cat.c > /tmp/includes.txt
+mysh> echo "run at $(date)" >> run.log   # date is an external command here
+mysh> cat < input.txt | sort | uniq > output.txt
+```
+
+#### Background execution
+
+Append `&` to run the entire command (or pipeline) in the background. The shell prints `[bg] PID` and returns to the prompt immediately. Background jobs are reaped automatically (no explicit `wait` needed).
+
+```sh
+mysh> sleep 30 &
+[bg] 12345
+mysh> echo "shell is free"
+
+mysh> cat huge_file.txt | sort > sorted.txt &
+[bg] 12346
+```
+
+`$?` after `cmd &` is always 0 — the job's exit status is not tracked.
+
+#### Comments
+
+A `#` that appears at the start of a word (not inside quotes, not adjacent to another word) begins a comment. The rest of the line is ignored.
+
+```sh
+mysh> # this entire line is a comment
+mysh> ls apps   # trailing comment — also ignored
+mysh> echo '#not a comment'   # inside single quotes: literal
+#not a comment
+```
+
+#### Script files
+
+Pass a filename as the first argument to run it as a script. All shell syntax works identically in scripts.
+
+```sh
+# deploy.sh
+DEST=/tmp/release
+mkdir -p $DEST
+cat README.md | grep "^#" > $DEST/headers.txt
+echo "done" >> $DEST/build.log
+```
+
+```sh
+shell/mysh deploy.sh
+```
+
+Scripts also accept stdin:
+
+```sh
+echo 'ls apps | wc -l' | shell/mysh
+```
+
+---
+
 ### Built-in commands
 
 | Command | Description |
