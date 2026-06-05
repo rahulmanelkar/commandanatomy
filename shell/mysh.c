@@ -49,6 +49,13 @@ extern cmd_spec_t cmd_tee_spec;
 extern cmd_spec_t cmd_pkg_spec;
 extern cmd_spec_t cmd_fetch_spec;
 
+/* ── natural-language '@' mode ───────────────────────────────────────────────
+ * An interactive line beginning with '@' bypasses pipeline parsing: the rest
+ * of the line is forwarded verbatim, as the fetch MESSAGE, to a local AI mock
+ * server. */
+#define AI_HOST "localhost"
+#define AI_PORT "5001"
+
 /*
  * When the shell reads commands from a piped/redirected stdin (not a tty and
  * not a named script file), we dup stdin to a fresh fd and read from that.
@@ -498,6 +505,24 @@ static void setup_path(void)
     setenv("PATH", new_path, 1);
 }
 
+/*
+ * Forward a natural-language prompt to the AI mock endpoint by reusing the
+ * fetch command's logic in-process (cmd_fetch_spec.run) — no fork, no second
+ * parse.  The prompt becomes fetch's MESSAGE positional; the "--" guards
+ * prompts that happen to start with '-'.  fetch writes the server's reply to
+ * out_stream itself, so the suggestion lands cleanly on the user's stream.
+ * Returns fetch's exit code.
+ */
+static int run_at_prompt(const char *prompt, FILE *in, FILE *out)
+{
+    char *fargv[] = {
+        "fetch", "-H", AI_HOST, "-p", AI_PORT, "--",
+        (char *)prompt, NULL
+    };
+    int fargc = (int)(sizeof fargv / sizeof fargv[0]) - 1;
+    return cmd_fetch_spec.run(fargc, fargv, in, out);
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
@@ -582,6 +607,48 @@ int main(int argc, char **argv)
 
         /* Strip trailing newline */
         line[strcspn(line, "\n")] = '\0';
+
+        /* ── natural-language '@' prefix ────────────────────────────────
+         * If the first non-whitespace character is '@', bypass tokenization
+         * and pipeline parsing entirely.  The remainder of the line is a raw
+         * prompt forwarded to the AI mock server via fetch. */
+        {
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;   /* first non-whitespace */
+            if (*p == '@') {
+                p++;                                   /* skip '@' */
+                while (*p == ' ' || *p == '\t') p++;   /* skip leading spaces */
+
+                if (!interactive) {
+                    /* '@' is an interactive convenience; ignore it in scripts
+                     * and piped input so non-interactive runs stay offline
+                     * and deterministic. */
+                    fprintf(stderr, "mysh: @: natural-language mode is "
+                                    "interactive only; ignoring\n");
+                    last_status = 0;
+                    continue;
+                }
+
+                /* Strip one optional pair of surrounding quotes. */
+                size_t plen = strlen(p);
+                if (plen >= 2 &&
+                    ((p[0] == '"'  && p[plen - 1] == '"') ||
+                     (p[0] == '\'' && p[plen - 1] == '\''))) {
+                    p[plen - 1] = '\0';
+                    p++;
+                }
+
+                if (*p == '\0') {
+                    fprintf(stderr, "mysh: @: empty prompt\n");
+                    last_status = 1;
+                    continue;
+                }
+
+                last_status = run_at_prompt(p, input, stdout);
+                fflush(stdout);
+                continue;
+            }
+        }
 
         /* Tokenize (with variable expansion) */
         tok_t tok;

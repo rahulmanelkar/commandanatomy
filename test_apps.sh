@@ -22,6 +22,7 @@
 #   30-36 pipelines     2- through 6-stage concurrent thread pipelines
 #   37-43 BNF shell lab VAR=value assignment, $VAR/$?/${VAR} expansion, & background
 #   44-47 fetch         TCP line round-trip, --json schema, refused error, mysh built-in
+#   48-49 @ mode        interactive NL prompt forwarded to AI mock, non-interactive skip
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -583,8 +584,116 @@ t_47() {
     wait "$SERVER_PID" 2>/dev/null
 }
 
+# @ natural-language mode ─────────────────────────────────────────────────────
+
+t_48() {
+    have_python || { skip_no_python 48 "@ — interactive NL prompt via fetch"; return; }
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 48 "@ — interactive prompt forwarded to AI mock (pty)"
+    printf "  ${DIM}[mysh pty]\$ @ list files please${RST}\n"
+
+    # Drive mysh through a real pty (the @ mode is interactive-only) with a
+    # mock AI server on port 5001 — the endpoint the shell forwards '@' to.
+    # The harness exits 0 iff the AI reply marker appears in the transcript.
+    local out code
+    out=$(python3 - <<'PY'
+import os, pty, socket, threading, time, select, signal, sys
+
+PORT, PROMPT = 5001, b"list files please"
+MARKER = b"AI_REPLY:" + PROMPT
+
+ready = threading.Event()
+
+def server():
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", PORT)); s.listen(1); s.settimeout(10)
+        ready.set()                       # bound+listening — safe to connect
+        c, _ = s.accept()
+        data = b""
+        while not data.endswith(b"\n"):
+            ch = c.recv(1024)
+            if not ch: break
+            data += ch
+        c.sendall(b"AI_REPLY:" + data.strip() + b"\n")
+        c.close()
+    except Exception:
+        pass
+    finally:
+        s.close()
+
+t = threading.Thread(target=server); t.start()
+if not ready.wait(5):                     # server failed to listen
+    sys.exit(2)
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("./shell/mysh", ["./shell/mysh"])
+    os._exit(127)
+
+os.write(fd, b"@ " + PROMPT + b"\n")
+
+# Read until the AI reply marker appears (deterministic), then quit — rather
+# than guessing timing with fixed sleeps.
+out = b""
+deadline = time.time() + 10
+while MARKER not in out and time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.3)
+    if r:
+        try: chunk = os.read(fd, 4096)
+        except OSError: break
+        if not chunk: break
+        out += chunk
+
+os.write(fd, b"exit\n")
+time.sleep(0.2)
+
+try: os.kill(pid, signal.SIGKILL)   # bound the test; harmless if already gone
+except OSError: pass
+try: os.waitpid(pid, 0)
+except OSError: pass
+t.join()
+
+sys.stdout.write(out.decode(errors="replace"))
+sys.exit(0 if MARKER in out else 1)
+PY
+)
+    code=$?
+
+    if (( code == 0 )); then
+        printf "  ${GRN}PASS${RST}\n"; printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  AI reply marker not found in pty transcript\n"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
+t_49() {
+    # '@' in non-interactive mode must be skipped gracefully (notice to stderr)
+    # without blocking the rest of the script.
+    local tmp; tmp=$(mktemp /tmp/rb_XXXXXX)
+    printf '@ this should be ignored\necho still-running\n' > "$tmp"
+
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 49 "@ — skipped gracefully in non-interactive mode"
+    printf "  ${DIM}[mysh]\$ @ this should be ignored ; echo still-running${RST}\n"
+
+    local out code
+    out=$("$MYSH" "$tmp" 2>/dev/null) && code=0 || code=$?
+    rm -f "$tmp"
+
+    if (( code == 0 )) && [[ "$out" == "still-running" ]]; then
+        printf "  ${GRN}PASS${RST}\n"; printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  expected stdout 'still-running' (got exit=%d)\n" "$code"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
 # ── registry & dispatch ───────────────────────────────────────────────────────
-ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47)
+ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49)
 
 # parse --test N flags; multiple --test flags accumulate
 SELECTED=()
