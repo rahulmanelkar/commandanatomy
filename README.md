@@ -690,7 +690,7 @@ Opens a TCP connection to `HOST:PORT`, sends `MESSAGE` followed by a newline, th
 | `-p`, `--port=PORT` | TCP port, 1–65535 (required) |
 | `--json` | Machine-readable JSON output |
 
-**Robustness:** inputs are validated before any network call (non-empty host ≤ 255 chars with no control characters; port in range). The receive socket is given a 5-second `SO_RCVTIMEO` timeout so a silent peer cannot hang the command. Every socket error — DNS resolution, `connect`, `send`, `recv`, or timeout — is reported and exits non-zero.
+**Robustness:** inputs are validated before any network call (non-empty host ≤ 255 chars with no control characters; port in range). Both the connect and the receive are bounded to 5 seconds — a non-blocking `connect` waited on with `poll`, plus a `SO_RCVTIMEO` on the socket — so neither an unreachable host nor a silent peer can hang the command. Every socket error — DNS resolution, `connect`, connect/receive timeout, `send`, or `recv` — is reported and exits non-zero.
 
 Exit status: 0 on success, 1 on any validation or network error.
 

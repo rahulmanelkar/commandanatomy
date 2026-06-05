@@ -379,12 +379,12 @@ The only networked command. It implements the canonical client sequence explicit
 Three robustness properties shape the implementation:
 
 - **Input validation before any syscall.** The host must be non-empty, ≤ `FETCH_MAX_HOST_LEN` (255, the RFC 1035 limit), and free of control characters; the port must be in `1–65535`. These bounds are named constants at the top of the file.
-- **Bounded receive.** After `connect`, the socket gets a 5-second `SO_RCVTIMEO` (`setsockopt` with a `struct timeval`), so a peer that accepts but never replies cannot hang the shell. A `recv` returning `EAGAIN`/`EWOULDBLOCK` is mapped to a `"timed out waiting for reply"` error.
+- **Bounded connect and receive.** The connect attempt is bounded to 5 seconds by `connect_timeout()`, which switches the socket to non-blocking, issues the `connect` (expecting `EINPROGRESS`), waits for writability with `poll()`, then checks `SO_ERROR` to distinguish a real connection from a failed one — restoring blocking mode on success. After connecting, the socket also gets a 5-second `SO_RCVTIMEO` (`setsockopt` with a `struct timeval`), so a peer that accepts but never replies cannot hang the shell either. A `recv` returning `EAGAIN`/`EWOULDBLOCK` is mapped to a `"timed out waiting for reply"` error; a connect timeout surfaces as `ETIMEDOUT` ("Connection timed out").
 - **No leaks on any path.** Every error path (`resolve`, `connect`, `setsockopt`, `send`, `recv`) closes the socket, frees the reply buffer, frees the argtable, and returns 1. `send_all` retries short writes and `EINTR`; the `socket`/`connect` loop walks every `addrinfo` candidate (so IPv4/IPv6 are both tried) and reports `strerror(errno)` only after all fail.
 
 `fetch` honours the shell's I/O isolation: the reply (and the structured `--json` object) is written to the passed-in `out_stream`, while plain-text diagnostics go to `stderr` so stdout stays clean for pipelines. In `--json` mode the error object is written to `out_stream` instead, so an agent capturing stdout still receives a structured failure. The JSON schema is single-line with stable keys — success: `{ok:true, host, port, sent, bytes, reply}`; failure: `{ok:false, host, port, error}` — with `ok` as the discriminator. It is registered as a shell built-in, so it runs in-process inside `mysh`.
 
-One acknowledged limitation: `connect()` itself is left blocking (no `SO_SNDTIMEO`, no non-blocking-connect + `select`), so an unreachable-but-routable host can stall at connect for the OS default before the recv timeout would ever apply. The 5-second bound covers the silent-peer case, which is the common failure in practice.
+Both timeouts are 5-second named constants (`FETCH_CONNECT_TIMEOUT_SECS`, `FETCH_RECV_TIMEOUT_SECS`). The send path is left blocking — a small single-line write to a connected socket is not a realistic stall point — so `SO_SNDTIMEO` is intentionally omitted.
 
 ---
 

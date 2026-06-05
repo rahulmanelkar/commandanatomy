@@ -4,15 +4,18 @@
 #include <errno.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>      /* struct timeval for SO_RCVTIMEO */
 
-/* Bounds for input validation. */
-#define FETCH_RECV_TIMEOUT_SECS 5
-#define FETCH_MAX_HOST_LEN      255   /* RFC 1035 hostname limit */
-#define FETCH_PORT_MIN          1
-#define FETCH_PORT_MAX          65535
+/* Bounds for input validation and network timeouts. */
+#define FETCH_CONNECT_TIMEOUT_SECS 5
+#define FETCH_RECV_TIMEOUT_SECS    5
+#define FETCH_MAX_HOST_LEN         255   /* RFC 1035 hostname limit */
+#define FETCH_PORT_MIN             1
+#define FETCH_PORT_MAX             65535
 #include "argtable3.h"
 #include "cmd_spec.h"
 
@@ -86,6 +89,58 @@ static int resolve_host(const char *host, int port,
         *errmsg = gai_strerror(rc);
         return -1;
     }
+    return 0;
+}
+
+/* connect() with a bounded timeout so an unreachable-but-routable host cannot
+ * stall for the kernel's default connect timeout.  The socket is switched to
+ * non-blocking for the attempt, the in-progress connect is waited on with
+ * poll(), and the original blocking mode is restored on success.  Returns 0 on
+ * success, -1 on error/timeout with errno set (ETIMEDOUT on timeout). */
+static int connect_timeout(int fd, const struct sockaddr *addr,
+                           socklen_t alen, int timeout_secs)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+        return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+
+    int rc = connect(fd, addr, alen);
+    if (rc == 0) {
+        /* Connected immediately (e.g. loopback). */
+        fcntl(fd, F_SETFL, flags);
+        return 0;
+    }
+    if (errno != EINPROGRESS)
+        return -1;                       /* hard failure, errno already set */
+
+    /* Wait for the socket to become writable (connect complete) or time out. */
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+    int pr;
+    do {
+        pr = poll(&pfd, 1, timeout_secs * 1000);
+    } while (pr < 0 && errno == EINTR);
+
+    if (pr == 0) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    if (pr < 0)
+        return -1;
+
+    /* poll() reports writability even on failed connects; check SO_ERROR. */
+    int soerr = 0;
+    socklen_t len = sizeof(soerr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &len) < 0)
+        return -1;
+    if (soerr != 0) {
+        errno = soerr;
+        return -1;
+    }
+
+    if (fcntl(fd, F_SETFL, flags) < 0)   /* restore blocking mode */
+        return -1;
     return 0;
 }
 
@@ -232,7 +287,8 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0)
             continue;                            /* try next candidate */
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+        if (connect_timeout(fd, rp->ai_addr, rp->ai_addrlen,
+                            FETCH_CONNECT_TIMEOUT_SECS) == 0)
             break;                               /* connected */
         close(fd);
         fd = -1;
