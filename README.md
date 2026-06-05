@@ -26,7 +26,8 @@ rahulbox/
 │   ├── uniq/               # report or omit repeated adjacent lines
 │   ├── cut/                # remove sections from each line of files
 │   ├── tee/                # read from stdin and write to stdout and files
-│   └── pkg/                # local package manager
+│   ├── pkg/                # local package manager
+│   └── fetch/              # send a message to a host over TCP
 ├── shell/
 │   ├── mysh.c              # shell main loop + execution engine
 │   ├── tok.c / tok.h       # quote-aware tokenizer
@@ -81,6 +82,7 @@ make -C apps/cut
 make -C apps/tee
 make -C apps/hello
 make -C apps/pkg
+make -C apps/fetch
 ```
 
 Each app produces a standalone binary (e.g. `apps/ls/ls`) and a static library (e.g. `apps/ls/libls.a`). The shell links the `.o` files directly from each app so there is only one copy of `argtable3` in the final binary.
@@ -670,6 +672,57 @@ apps/pkg/pkg remove myapp 1.0.0
 ```
 
 `~/.mysh/bin` is automatically added to `PATH` by the shell on startup, so installed binaries are immediately available after `pkg install`.
+
+---
+
+### `fetch` — send a message to a host over TCP
+
+```sh
+apps/fetch/fetch -H HOST -p PORT [--json] MESSAGE
+```
+
+Opens a TCP connection to `HOST:PORT`, sends `MESSAGE` followed by a newline, then reads and prints the server's reply line. Uses a **line-based protocol**: each request is newline-terminated, and the reply is read up to (and including) its terminating newline.
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Show help and exit |
+| `-H`, `--host=HOST` | Host to connect to (name or IP; required) |
+| `-p`, `--port=PORT` | TCP port, 1–65535 (required) |
+| `--json` | Machine-readable JSON output |
+
+**Robustness:** inputs are validated before any network call (non-empty host ≤ 255 chars with no control characters; port in range). The receive socket is given a 5-second `SO_RCVTIMEO` timeout so a silent peer cannot hang the command. Every socket error — DNS resolution, `connect`, `send`, `recv`, or timeout — is reported and exits non-zero.
+
+Exit status: 0 on success, 1 on any validation or network error.
+
+**Output streams:** the reply (and, in `--json` mode, the structured result) goes to stdout via the shell-supplied `out_stream`; plain-text error messages go to stderr, keeping stdout clean for pipelines. `fetch` is registered as a shell built-in, so it runs in-process inside `mysh`.
+
+**JSON schema** (single line, stable keys):
+
+```jsonc
+// success
+{"ok": true, "host": "127.0.0.1", "port": 8080, "sent": "ping", "bytes": 5, "reply": "pong\n"}
+// failure (stdout in --json mode)
+{"ok": false, "host": "127.0.0.1", "port": 8080, "error": "timed out waiting for reply"}
+```
+
+`ok` is always present as the discriminator; `host` and `port` are always echoed back. All string fields are JSON-escaped (control bytes as `\uXXXX`).
+
+**Examples:**
+
+```sh
+# Send a line to an echo/line server and print the reply
+apps/fetch/fetch -H 127.0.0.1 -p 8080 "hello world"
+
+# Machine-readable output for agent/MCP integration
+apps/fetch/fetch --json -H 127.0.0.1 -p 8080 ping
+
+# Inside the shell, compose with other built-ins
+fetch --json -H 127.0.0.1 -p 8080 ping | grep '"ok": true'
+
+# Errors go to stderr and exit non-zero
+apps/fetch/fetch -H 127.0.0.1 -p 9 hi
+# fetch: connect: Connection refused
+```
 
 ---
 

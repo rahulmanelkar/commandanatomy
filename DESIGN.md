@@ -25,7 +25,8 @@ rahulbox/
 │   ├── ls/  wc/  cat/  stat/
 │   ├── echo/  head/  tail/  grep/
 │   ├── sort/  uniq/  cut/  tee/
-│   └── pkg/
+│   ├── pkg/               # local package manager
+│   └── fetch/             # TCP line client
 ├── shell/
 │   ├── mysh.c              # shell main loop + execution engine
 │   ├── tok.c / tok.h       # tokenizer
@@ -118,6 +119,7 @@ Every command implements `--json` for agent and MCP integration. The convention:
 - `grep --json` emits `[{"file": "...", "matches": [{"line": N, "text": "..."}]}]`
 - `uniq --json` emits `[{"count": N, "line": "..."}]`
 - `sort --json` emits a flat JSON array of strings
+- `fetch --json` emits a single object with an `ok` discriminator — `{"ok": true, "host": ..., "port": ..., "sent": ..., "bytes": N, "reply": ...}` on success, `{"ok": false, "host": ..., "port": ..., "error": ...}` on failure. Unlike the file commands, `fetch` writes its error object to stdout (not stderr) in `--json` mode, so an agent capturing stdout always receives a parseable result.
 
 ---
 
@@ -300,7 +302,7 @@ At startup, `setup_path` checks whether `~/.mysh/bin` exists. If so, it prepends
 
 ### Registry
 
-The registry is a fixed-size flat array of `cmd_spec_t *` (max 64 entries). `reg_register` appends; `reg_find` is a linear scan by name. At 13 current commands this is negligible cost. Registration order determines the order entries appear in `help` output.
+The registry is a fixed-size flat array of `cmd_spec_t *` (max 64 entries). `reg_register` appends; `reg_find` is a linear scan by name. At 15 current commands this is negligible cost. Registration order determines the order entries appear in `help` output.
 
 ---
 
@@ -369,6 +371,20 @@ Follows the full `cmd_spec_t` anatomy. Subcommands (`build`, `install`, `list`, 
 Subcommands: `build` (shells out to `tar -czf`), `install` (shells out to `tar -xzf` into a scratch directory, parses `pkg.json`, then moves the tree to `~/.mysh/pkgs/<name>-<ver>/` and symlinks declared binaries into `~/.mysh/bin/`; handles cross-filesystem moves via `cp` + `rm` fallback when `rename(2)` returns `EXDEV`), `list` (scans `~/.mysh/pkgs/` and reads each package's `pkg.json` for a description), `remove` (unlinks `~/.mysh/bin/` symlinks pointing into the package tree, then `rm -rf`; when no version is given, picks the lexicographically latest installed version).
 
 Packages are described by a `pkg.json` manifest parsed with a minimal hand-written JSON reader (no library dependency beyond what the rest of the project already uses).
+
+### `fetch` — TCP line client
+
+The only networked command. It implements the canonical client sequence explicitly — `getaddrinfo` → `socket` → `connect` → `send` → `recv` — over a **line-based protocol**: the request is `MESSAGE` plus a trailing `\n`, and the reply is read until the terminating newline (detected with `memchr`) or until the peer closes. Arguments are `-H/--host` and `-p/--port` options plus a positional `MESSAGE`; `--json` selects machine-readable output.
+
+Three robustness properties shape the implementation:
+
+- **Input validation before any syscall.** The host must be non-empty, ≤ `FETCH_MAX_HOST_LEN` (255, the RFC 1035 limit), and free of control characters; the port must be in `1–65535`. These bounds are named constants at the top of the file.
+- **Bounded receive.** After `connect`, the socket gets a 5-second `SO_RCVTIMEO` (`setsockopt` with a `struct timeval`), so a peer that accepts but never replies cannot hang the shell. A `recv` returning `EAGAIN`/`EWOULDBLOCK` is mapped to a `"timed out waiting for reply"` error.
+- **No leaks on any path.** Every error path (`resolve`, `connect`, `setsockopt`, `send`, `recv`) closes the socket, frees the reply buffer, frees the argtable, and returns 1. `send_all` retries short writes and `EINTR`; the `socket`/`connect` loop walks every `addrinfo` candidate (so IPv4/IPv6 are both tried) and reports `strerror(errno)` only after all fail.
+
+`fetch` honours the shell's I/O isolation: the reply (and the structured `--json` object) is written to the passed-in `out_stream`, while plain-text diagnostics go to `stderr` so stdout stays clean for pipelines. In `--json` mode the error object is written to `out_stream` instead, so an agent capturing stdout still receives a structured failure. The JSON schema is single-line with stable keys — success: `{ok:true, host, port, sent, bytes, reply}`; failure: `{ok:false, host, port, error}` — with `ok` as the discriminator. It is registered as a shell built-in, so it runs in-process inside `mysh`.
+
+One acknowledged limitation: `connect()` itself is left blocking (no `SO_SNDTIMEO`, no non-blocking-connect + `select`), so an unreachable-but-routable host can stall at connect for the OS default before the recv timeout would ever apply. The 5-second bound covers the silent-peer case, which is the common failure in practice.
 
 ---
 

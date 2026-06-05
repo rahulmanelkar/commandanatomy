@@ -47,6 +47,7 @@ extern cmd_spec_t cmd_uniq_spec;
 extern cmd_spec_t cmd_cut_spec;
 extern cmd_spec_t cmd_tee_spec;
 extern cmd_spec_t cmd_pkg_spec;
+extern cmd_spec_t cmd_fetch_spec;
 
 /*
  * When the shell reads commands from a piped/redirected stdin (not a tty and
@@ -516,6 +517,7 @@ int main(int argc, char **argv)
     reg_register(&cmd_cut_spec);
     reg_register(&cmd_tee_spec);
     reg_register(&cmd_pkg_spec);
+    reg_register(&cmd_fetch_spec);
 
     setup_path();
 
