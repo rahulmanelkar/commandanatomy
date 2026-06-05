@@ -21,6 +21,7 @@
 #   29    tee           fanout to stdout and file
 #   30-36 pipelines     2- through 6-stage concurrent thread pipelines
 #   37-43 BNF shell lab VAR=value assignment, $VAR/$?/${VAR} expansion, & background
+#   44-47 fetch         TCP line round-trip, --json schema, refused error, mysh built-in
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -48,6 +49,50 @@ setup() {
     printf "alice,30\nbob,25\ncarol,35\n"           > "$F_CSV"
 }
 teardown() { rm -f "$F_FRUITS" "$F_NUMS" "$F_CSV" "$F_TEE"; }
+
+# ── fetch helpers ─────────────────────────────────────────────────────────────
+# The fetch tests need a live TCP peer.  start_echo_server spins up a one-shot
+# line server in the background that reads a single newline-terminated request
+# and replies "echo: <request>".  It sets SERVER_PID for the caller to wait on.
+SERVER_PID=0
+have_python() { command -v python3 > /dev/null 2>&1; }
+
+start_echo_server() {  # $1 = port
+    local port=$1 ready
+    ready=$(mktemp /tmp/rb_ready_XXXXXX); rm -f "$ready"
+    python3 -c '
+import socket, sys
+port = int(sys.argv[1]); readyfile = sys.argv[2]
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port)); s.listen(1)
+s.settimeout(10)               # never hang the suite if no client arrives
+open(readyfile, "w").close()   # signal "listening" to the shell
+try:
+    c, _ = s.accept()
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = c.recv(1024)
+        if not chunk: break
+        data += chunk
+    c.sendall(b"echo: " + data)
+    c.close()
+except Exception:
+    pass
+finally:
+    s.close()
+' "$port" "$ready" &
+    SERVER_PID=$!
+    # Wait until the server has bound+listened (ready file appears), max ~2s.
+    local i=0
+    while [[ ! -e "$ready" ]] && (( i < 100 )); do sleep 0.02; (( i++ )); done
+    rm -f "$ready"
+}
+
+skip_no_python() {  # $1 = test num, $2 = desc
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" "$1" "$2"
+    printf "  ${YLW}SKIP${RST}  python3 not available (needed for a test TCP server)\n"
+}
 
 # ── counters ──────────────────────────────────────────────────────────────────
 N_PASS=0 N_FAIL=0
@@ -486,8 +531,60 @@ t_43() {
     fi
 }
 
+# fetch ───────────────────────────────────────────────────────────────────────
+
+t_44() {
+    have_python || { skip_no_python 44 "fetch — TCP line round-trip"; return; }
+    start_echo_server 54370
+    run_test 44 "fetch — TCP line round-trip (send + reply)" \
+        "echo: hello fetch" \
+        ./apps/fetch/fetch -H 127.0.0.1 -p 54370 "hello fetch"
+    wait "$SERVER_PID" 2>/dev/null
+}
+
+t_45() {
+    have_python || { skip_no_python 45 "fetch --json — stable schema"; return; }
+    start_echo_server 54371
+    # Exact JSON match: keys, echoed host/port/sent, byte count, escaped reply.
+    # "echo: ping\n" is 11 bytes; the reply newline is escaped as \n.
+    run_test 45 "fetch --json — stable schema round-trip" \
+        '{"ok": true, "host": "127.0.0.1", "port": 54371, "sent": "ping", "bytes": 11, "reply": "echo: ping\n"}' \
+        ./apps/fetch/fetch --json -H 127.0.0.1 -p 54371 ping
+    wait "$SERVER_PID" 2>/dev/null
+}
+
+t_46() {
+    # No server is listening: connect must fail fast, exit non-zero, and print
+    # a clear "refused" message to stderr.
+    local port=54399
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 46 "fetch — connection refused exits non-zero"
+    printf "  ${DIM}\$ ./apps/fetch/fetch -H 127.0.0.1 -p %s hi${RST}\n" "$port"
+
+    local out code
+    out=$(./apps/fetch/fetch -H 127.0.0.1 -p "$port" hi 2>&1); code=$?
+
+    if (( code != 0 )) && printf '%s' "$out" | grep -qi "refused"; then
+        printf "  ${GRN}PASS${RST}\n"; printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  expected non-zero exit and a 'refused' message (got exit=%d)\n" "$code"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
+t_47() {
+    have_python || { skip_no_python 47 "fetch — runs as a mysh built-in"; return; }
+    start_echo_server 54372
+    # Proves fetch is registered in the shell registry and runs in-process.
+    run_mysh 47 "fetch — runs as a mysh built-in" \
+        "echo: viamysh" \
+        "fetch -H 127.0.0.1 -p 54372 viamysh"
+    wait "$SERVER_PID" 2>/dev/null
+}
+
 # ── registry & dispatch ───────────────────────────────────────────────────────
-ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43)
+ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47)
 
 # parse --test N flags; multiple --test flags accumulate
 SELECTED=()
