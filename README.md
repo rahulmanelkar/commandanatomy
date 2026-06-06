@@ -769,6 +769,7 @@ The prompt shows the last exit code when non-zero: `mysh [1]> `.
 | Background execution | `sleep 10 &` — runs in background, prints `[bg] PID`, shell continues |
 | Comments | `# this line is ignored` |
 | Script files | `mysh deploy.sh` |
+| Natural-language `@` prefix | `@ what lists files` — forwards the prompt to a local AI mock server (interactive only) |
 
 ### Shell syntax reference
 
@@ -931,13 +932,29 @@ Scripts also accept stdin:
 echo 'ls apps | wc -l' | shell/mysh
 ```
 
+#### Natural-language `@` prefix
+
+When an **interactive** line's first non-whitespace character is `@`, the shell bypasses tokenization and pipeline parsing entirely. The rest of the line is taken as a raw prompt and forwarded — using the `fetch` command's logic in-process — to a local AI mock server at `localhost:5001`, and the server's reply is printed back to you.
+
+```sh
+mysh> @ what command lists files in detail
+AI: try 'ls -la'
+```
+
+- One optional pair of surrounding quotes is stripped: `@ "list files"` sends `list files`.
+- An empty prompt (`@` alone) reports an error and sets `$?` to 1.
+- If the server is unreachable, `fetch`'s `Connection refused` is printed to stderr and the shell continues normally.
+- `@` is an **interactive-only** convenience: in a script or piped input it is skipped with a notice on stderr (so non-interactive runs stay offline and deterministic), and the rest of the script runs.
+
+The endpoint is `AI_HOST`/`AI_PORT` in `shell/mysh.c`. Any line server that reads a newline-terminated request and replies with a line works as the backend — see the `fetch` command for the protocol.
+
 ---
 
 ### Note: internal vs external command execution
 
 The shell uses three execution strategies, chosen at dispatch time:
 
-- **Registered commands (no fork, no exec)** — `reg_find()` checks the in-memory registry first. If found, `spec->run()` is called directly with explicit `FILE*` streams, either on the main thread (single-stage) or a `pthread_create`'d thread (pipeline stage). Current registered commands: `hello`, `ls`, `stat`, `wc`, `cat`, `echo`, `head`, `tail`, `grep`, `sort`, `uniq`, `cut`, `tee`, `pkg`.
+- **Registered commands (no fork, no exec)** — `reg_find()` checks the in-memory registry first. If found, `spec->run()` is called directly with explicit `FILE*` streams, either on the main thread (single-stage) or a `pthread_create`'d thread (pipeline stage). Current registered commands: `hello`, `ls`, `stat`, `wc`, `cat`, `echo`, `head`, `tail`, `grep`, `sort`, `uniq`, `cut`, `tee`, `pkg`, `fetch`.
 
 - **External commands (fork + execvp)** — if `reg_find()` returns NULL, the shell falls back to `fork()` + `execvp()`. Anything on `PATH` works: `git`, `python3`, `make`, etc.
 
