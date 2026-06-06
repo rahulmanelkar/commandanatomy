@@ -416,6 +416,14 @@ The stack-allocated `void *tbl[N]` pattern makes each builder invocation operate
 
 `sort` uses `qsort_r` (GNU extension, available via `_GNU_SOURCE`) rather than `qsort`. `qsort_r` accepts a `void *` context pointer and forwards it to every comparator call, so all comparator options live in a stack-local `sort_ctx_t` struct. Two concurrent `sort` stages in the same pipeline are fully independent.
 
+### Thread-local getopt state in argtable3
+
+The builder pattern keeps each command's *argtable* on its own stack, but the **parse** itself was not thread-safe. The vendored argtable3 amalgamation parses with an embedded BSD getopt whose entire working state is process-global: the externs `optind`/`optarg`/`opterr`/`optopt`/`optreset`/`opterrmsg`, and the statics `place`/`nonopt_start`/`nonopt_end`/`dash_prefix`/`posixly_correct`. Every `arg_parse` resets `optind = 0` and then walks/permutes `argv` through those globals.
+
+When two pipeline stages run as concurrent threads, both enter `arg_parse` at once and clobber each other's `optind`, producing intermittent argv corruption: a dropped flag (`wc` runs in default mode instead of `-w`), a skipped positional (`grep: missing option PATTERN`), or the program name read as an argument (`wc: wc: No such file or directory`). The failures were timing-dependent — roughly 40% of full test-suite runs hit one.
+
+The fix marks that mutable getopt state `__thread` (thread-local) in `vendor/argtable3/argtable3.c`, so each pipeline thread gets its own private parser state and the stages no longer interfere. This preserves the in-process threaded-pipeline design rather than falling back to forked stages. It is a local patch to a vendored file and **must be re-applied after any argtable3 upgrade** (the edited lines carry a comment marking them). After the fix, the previously flaky pipelines pass 100/100 in isolation and the full suite is green across repeated runs.
+
 ### stdin contamination fix (`g_cmd_fd`)
 
 When the shell's own command input arrives on fd 0 (e.g. `echo "ls\nexit" | mysh`), forked children would inherit that fd and could accidentally consume command text. The fix — `dup`ing fd 0 to a new fd and reading commands from there — ensures fd 0 remains clean for children. Each fork child immediately closes `g_cmd_fd`.

@@ -1380,12 +1380,12 @@ int	getopt_long_only(int, char * const *, const char *,
 #define	_GETOPT_DECLARED
 int getopt(int, char * const [], const char *);
 
-extern char *optarg;			/* getopt(3) external variables */
-extern int optind, opterr, optopt;
+extern __thread char *optarg;			/* getopt(3) external variables */
+extern __thread int optind, opterr, optopt;
 #endif
 #ifndef _OPTRESET_DECLARED
 #define	_OPTRESET_DECLARED
-extern int optreset;			/* getopt(3) external variable */
+extern __thread int optreset;			/* getopt(3) external variable */
 #endif
 
 #ifdef __cplusplus
@@ -1463,11 +1463,15 @@ extern int optreset;			/* getopt(3) external variable */
 
 #define GNU_COMPATIBLE		/* Be more compatible, configure's use us! */
 
-int	opterr = 1;		/* if error message should be printed */
-int	optind = 1;		/* index into parent argv vector */
-int	optopt = '?';	/* character checked for validity */
-int	optreset;		/* reset getopt */
-char *optarg;		/* argument associated with option */
+/* These getopt globals are made thread-local (__thread) so that mysh can run
+ * multiple argtable3-parsing commands concurrently, one per pipeline stage,
+ * without the stages racing on the shared parser state.  Local patch to the
+ * vendored amalgamation — re-apply after any argtable3 upgrade. */
+__thread int	opterr = 1;		/* if error message should be printed */
+__thread int	optind = 1;		/* index into parent argv vector */
+__thread int	optopt = '?';	/* character checked for validity */
+__thread int	optreset;		/* reset getopt */
+__thread char *optarg;		/* argument associated with option */
 
 #define PRINT_ERROR	((opterr) && (*options != ':'))
 
@@ -1496,17 +1500,17 @@ static int parse_long_options(char * const *, const char *,
 static int gcd(int, int);
 static void permute_args(int, int, int, char * const *);
 
-static char *place = EMSG; /* option letter processing */
+static __thread char *place = EMSG; /* option letter processing */
 
 /* XXX: set optreset to 1 rather than these two */
-static int nonopt_start = -1; /* first non option argument (for permute) */
-static int nonopt_end = -1;   /* first option after non options (for permute) */
+static __thread int nonopt_start = -1; /* first non option argument (for permute) */
+static __thread int nonopt_end = -1;   /* first option after non options (for permute) */
 
 /* Error messages */
 static const char recargchar[] = "option requires an argument -- %c";
 static const char illoptchar[] = "illegal option -- %c"; /* From P1003.2 */
 #ifdef GNU_COMPATIBLE
-static int dash_prefix = NO_PREFIX;
+static __thread int dash_prefix = NO_PREFIX;
 static const char gnuoptchar[] = "invalid option -- %c";
 
 static const char recargstring[] = "option `%s%s' requires an argument";
@@ -1535,8 +1539,8 @@ static const char illoptstring[] = "unknown option -- %s";
 
 #define MAX_OPTERRMSG_SIZE 128
 
-extern char opterrmsg[MAX_OPTERRMSG_SIZE];
-char opterrmsg[MAX_OPTERRMSG_SIZE]; /* buffer for the last error message */
+extern __thread char opterrmsg[MAX_OPTERRMSG_SIZE];
+__thread char opterrmsg[MAX_OPTERRMSG_SIZE]; /* buffer for the last error message */
 
 static void warnx(const char* fmt, ...) {
     va_list ap;
@@ -1796,7 +1800,7 @@ getopt_internal(int nargc, char * const *nargv, const char *options,
 {
 	char *oli;				/* option letter list index */
 	int optchar, short_too;
-	static int posixly_correct = -1;
+	static __thread int posixly_correct = -1;
 
 	if (options == NULL)
 		return (-1);
