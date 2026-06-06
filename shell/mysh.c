@@ -118,6 +118,10 @@ static int parse_pipeline(tok_t *tok, stage_t *stages, int *nstages)
         char *w = tok->w[i];
 
         if (strcmp(w, "|") == 0) {
+            if (cur->argc == 0) {
+                fprintf(stderr, "mysh: syntax error near '|'\n");
+                return -1;
+            }
             cur->argv[cur->argc] = NULL;
             if (*nstages >= PIPELINE_MAX) {
                 fprintf(stderr, "mysh: too many pipe stages\n");
@@ -149,6 +153,10 @@ static int parse_pipeline(tok_t *tok, stage_t *stages, int *nstages)
         }
     }
     cur->argv[cur->argc] = NULL;
+    if (*nstages > 1 && cur->argc == 0) {
+        fprintf(stderr, "mysh: syntax error near '|'\n");
+        return -1;
+    }
 
     if (stages[0].argc == 0) { *nstages = 0; return 0; }
     return 0;

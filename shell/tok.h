@@ -11,7 +11,8 @@ typedef struct {
 /*
  * Split line into tokens.  Recognises:
  *   - whitespace word boundaries
- *   - 'single' and "double" quoting (no variable expansion)
+ *   - 'single' quoting (fully literal) and "double" quoting
+ *     ($ still expands; \" \\ \$ are escapes; all else literal)
  *   - operators < > >> | returned as their own words
  *   - # starts a comment (rest of line ignored)
  *

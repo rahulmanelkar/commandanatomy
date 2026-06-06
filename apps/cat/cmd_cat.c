@@ -95,8 +95,13 @@ static int cat_json(FILE *fp, FILE *out, const char *label, int is_last)
     while ((n = fread(tmp, 1, sizeof(tmp), fp)) > 0) {
         if (size + n + 1 > cap) {
             cap = (size + n + 1) * 2 + 4096;
-            buf = realloc(buf, cap);
-            if (!buf) { fprintf(stderr, "cat: out of memory\n"); return 1; }
+            char *bigger = realloc(buf, cap);
+            if (!bigger) {
+                fprintf(stderr, "cat: out of memory\n");
+                free(buf);                  /* old key still valid */
+                return 1;
+            }
+            buf = bigger;
         }
         memcpy(buf + size, tmp, n);
         size += n;
