@@ -11,6 +11,8 @@
  *   - Comment lines starting with #
  *   - Script mode: mysh script.sh  (or pipe/redirect stdin)
  *   - ~/.mysh/bin automatically prepended to PATH on startup
+ *   - Interactive line editing: Left/Right arrows, Home/End, Delete,
+ *     kill shortcuts (linedit.c); scripts and pipes still use fgets
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -30,6 +32,7 @@
 
 #include "../include/cmd_spec.h"
 #include "tok.h"
+#include "linedit.h"
 
 /* ── external cmd_spec_t exports from app modules ───────────────────────── */
 
@@ -591,18 +594,22 @@ int main(int argc, char **argv)
         /* Reap any finished background jobs to avoid zombies. */
         while (waitpid(-1, NULL, WNOHANG) > 0);
 
-        /* Prompt */
+        /* Read the next line: raw-mode line editor at an interactive
+         * prompt (arrow keys, Home/End, ...), plain fgets for scripts
+         * and piped input. */
         if (interactive) {
+            char prompt[32];
             if (last_status != 0)
-                printf("mysh [%d]> ", last_status);
+                snprintf(prompt, sizeof prompt, "mysh [%d]> ", last_status);
             else
-                printf("mysh> ");
-            fflush(stdout);
-        }
+                snprintf(prompt, sizeof prompt, "mysh> ");
 
-        if (!fgets(line, sizeof line, input)) {
-            if (interactive) printf("\n");
-            break;   /* EOF (Ctrl-D in interactive, end of script file) */
+            if (linedit_read(input, prompt, line, sizeof line) < 0) {
+                printf("\n");
+                break;   /* EOF: Ctrl-D at an empty prompt */
+            }
+        } else if (!fgets(line, sizeof line, input)) {
+            break;       /* end of script file / piped input */
         }
 
         /* Strip trailing newline */

@@ -44,17 +44,20 @@ apps:
 	$(MAKE) -C ../apps/pkg
 	$(MAKE) -C ../apps/fetch
 
-mysh: mysh.o tok.o argtable3.o $(APP_OBJS)
+mysh: mysh.o tok.o linedit.o argtable3.o $(APP_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-mysh.o: mysh.c tok.h
+mysh.o: mysh.c tok.h linedit.h
 	$(CC) $(CFLAGS) $(ARGTABLE_INC) -c -o $@ $<
 
 tok.o: tok.c tok.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+linedit.o: linedit.c linedit.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 argtable3.o: $(ARGTABLE_SRC)
 	$(CC) $(CFLAGS) $(ARGTABLE_INC) -c -o $@ $<
 
 clean:
-	rm -f mysh mysh.o tok.o argtable3.o
+	rm -f mysh mysh.o tok.o linedit.o argtable3.o

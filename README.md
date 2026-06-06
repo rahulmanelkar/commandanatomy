@@ -92,7 +92,7 @@ Each app produces a standalone binary (e.g. `apps/ls/ls`) and a static library (
 `test_apps.sh` is a manual test runner that exercises every app and the shell's pipeline executor. Run it from the repo root after building:
 
 ```sh
-./test_apps.sh                          # run all 43 tests
+./test_apps.sh                          # run all 58 tests
 ./test_apps.sh --test 1                 # run a single test by number
 ./test_apps.sh --test 1 --test 2        # run multiple specific tests
 ```
@@ -770,6 +770,27 @@ The prompt shows the last exit code when non-zero: `mysh [1]> `.
 | Comments | `# this line is ignored` |
 | Script files | `mysh deploy.sh` |
 | Natural-language `@` prefix | `@ what lists files` — forwards the prompt to a local AI mock server (interactive only) |
+| Interactive line editing | Left/Right arrows, Ctrl-Left/Right, Home/End, Delete, Ctrl-A/E/U/K/W — edit anywhere in the line ([details](#line-editing)) |
+
+### Line editing
+
+At an interactive prompt the shell runs its own raw-mode line editor (`shell/linedit.c` — no readline dependency), so you can move the cursor back into a typed line and fix it in place:
+
+| Key | Action |
+|---|---|
+| `←` / `→` | Move the cursor one character |
+| `Ctrl+←` / `Ctrl+→` | Move the cursor one word |
+| `Home` / `End` (or `Ctrl+A` / `Ctrl+E`) | Jump to start / end of line |
+| `Backspace` | Delete the character before the cursor |
+| `Delete` | Delete the character under the cursor |
+| `Ctrl+U` / `Ctrl+K` | Kill to start / to end of line |
+| `Ctrl+W` | Kill the word before the cursor |
+| `Ctrl+L` | Clear the screen, keeping the current line |
+| `Ctrl+C` | Abandon the current line (prints `^C`, fresh prompt) |
+| `Ctrl+D` | Exit at an empty prompt; `Delete` otherwise |
+| `Enter` | Run the line (the cursor can be anywhere in it) |
+
+Lines longer than the terminal never wrap — the visible portion scrolls horizontally so the cursor stays on the prompt row. `↑`/`↓` are recognised and ignored (command history is not implemented yet). The editor only engages on a real terminal: script files, piped input, and `TERM=dumb` keep the plain `fgets` behaviour.
 
 ### Shell syntax reference
 
@@ -1127,6 +1148,8 @@ The following features are intentionally absent or not yet implemented:
 
 | Missing feature | Notes |
 |---|---|
+| Command history (`↑` / `↓`) | The line editor recognises and ignores Up/Down; no history buffer yet |
+| Tab completion | `Tab` inserts a literal tab (rendered as a space while editing) |
 | Glob expansion (`*.c`, `?`) | Passed literally to the command; use external `find` or `ls` instead |
 | Command substitution (`$(cmd)`) | Not supported; chain through a variable or pipeline instead |
 | `&&` / `\|\|` conditional operators | Only `\|` (pipe) is supported; use `;` via script for sequencing |

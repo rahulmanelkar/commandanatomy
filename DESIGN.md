@@ -31,6 +31,7 @@ rahulbox/
 ├── shell/
 │   ├── mysh.c              # shell main loop + execution engine
 │   ├── tok.c / tok.h       # tokenizer
+│   ├── linedit.c / linedit.h  # raw-mode interactive line editor
 │   └── Makefile
 └── Makefile                # top-level coordinator
 ```
@@ -161,7 +162,7 @@ APP_OBJS = ../apps/cat/cmd_cat.o \
            ../apps/grep/cmd_grep.o \
            ...
 
-mysh: mysh.o tok.o argtable3.o $(APP_OBJS)
+mysh: mysh.o tok.o linedit.o argtable3.o $(APP_OBJS)
     $(CC) -o $@ $^ -lm -lpthread
 ```
 
@@ -179,17 +180,30 @@ The root Makefile lists only the original five apps explicitly (it predates the 
 
 ### Architecture
 
-`mysh` is a single-file shell (`mysh.c`, ~770 lines). Its main loop:
+`mysh`'s main loop and execution engine live in one file (`mysh.c`, ~780 lines), with the tokenizer (`tok.c`) and the interactive line editor (`linedit.c`) as support modules. The main loop:
 
 1. Reap finished background jobs with `waitpid(-1, NULL, WNOHANG)`
-2. Print prompt if interactive
-3. `fgets` one line, strip the trailing newline
-4. **Natural-language `@` prefix** — if the first non-whitespace character is `@`, forward the rest of the line to the AI mock server and skip the normal path (see below)
-5. Tokenize via `tok_split` (expands `$VAR`/`${VAR}`/`$?` in place)
-6. Strip a trailing `&` token and set a `bg` flag if present
-7. Parse pipeline stages via `parse_pipeline`
-8. Handle built-ins (`cd`, `exit`, `help`, `VAR=value`) for single-stage commands
-9. Execute via `run_pipeline`; if `bg`, fork the whole pipeline and continue
+2. Read one line — interactive: prompt + raw-mode line editor (`linedit_read`); script/piped input: plain `fgets` — and strip the trailing newline
+3. **Natural-language `@` prefix** — if the first non-whitespace character is `@`, forward the rest of the line to the AI mock server and skip the normal path (see below)
+4. Tokenize via `tok_split` (expands `$VAR`/`${VAR}`/`$?` in place)
+5. Strip a trailing `&` token and set a `bg` flag if present
+6. Parse pipeline stages via `parse_pipeline`
+7. Handle built-ins (`cd`, `exit`, `help`, `VAR=value`) for single-stage commands
+8. Execute via `run_pipeline`; if `bg`, fork the whole pipeline and continue
+
+### Interactive line editing (`linedit.c`)
+
+Canonical ("cooked") terminal input only allows editing at the end of the line — the kernel buffers the line, backspace is the only editing key, and arrow keys arrive as multi-byte escape sequences that land in the buffer as garbage. `linedit_read(in, prompt, buf, bufsz)` replaces `fgets` at the interactive prompt and implements the editing keys itself.
+
+**Raw mode, scoped to one read.** The terminal is switched into raw mode (`ECHO | ICANON | ISIG | IEXTEN` cleared, plus `ICRNL`/`IXON` on input) only while a line is being edited, and restored with `TCSADRAIN` before `linedit_read` returns — so commands always run with the terminal in its original mode, and pending type-ahead (e.g. a pasted second command line) survives the switch. An `atexit` handler restores the terminal even if the shell exits mid-edit. Because `ISIG` is cleared, Ctrl-C arrives as byte `0x03` and is handled by the editor (abandon the line, print `^C`, fresh prompt) instead of raising a signal.
+
+**Key map.** Left/Right arrows and Ctrl-B/F move by one character; Ctrl-Left/Right (`ESC[1;5D/C`) move by one word; Home/End in all common encodings (`ESC[H/F`, `ESC[1~/4~`, `ESC[7~/8~`, `ESC OH/OF`) and Ctrl-A/E jump to the line ends; Backspace and Delete (`ESC[3~`) delete before/under the cursor; Ctrl-U/K/W kill to start / to end / previous word; Ctrl-L clears the screen; Ctrl-D is EOF at an empty prompt and Delete otherwise; Enter accepts the line wherever the cursor is. Up/Down (history) are consumed and ignored — history is not implemented yet.
+
+**Escape-sequence decoding.** After a raw `ESC`, continuation bytes are read with a 50 ms `poll` timeout: a lone Escape keypress times out and is dropped, while a terminal's arrow-key burst arrives instantly. The CSI parser accepts `digits[;digits]` parameters before the final byte, so unknown keys (F-keys, PgUp/PgDn) are consumed without leaking bytes into the line. If a sequence turns out to be malformed — a control byte such as Enter or Ctrl-C appears where a sequence byte belongs — that byte is returned to the main key loop and dispatched as a keypress rather than swallowed.
+
+**Single-row display with horizontal scrolling** (the linenoise approach). Every keystroke redraws the prompt row: `\r` + prompt + visible window + `ESC[0K` (erase stale tail) + cursor reposition. If prompt + line exceed the terminal width (re-queried per refresh, so live resizes track), leading characters scroll off so the cursor stays visible, and the row is clipped before the final column to avoid auto-wrap. Cursor arithmetic counts bytes, so multi-byte UTF-8 input edits correctly but draws the cursor slightly off — ASCII is exact.
+
+**Cooked-mode fallback.** If stdin or stdout is not a tty, `TERM` is `dumb`/`cons25`/`emacs`, or `tcsetattr` fails, `linedit_read` falls back to printing the prompt and reading with `fgets` — script files, piped input, and dumb terminals behave exactly as before the editor existed.
 
 ### Natural-language `@` prefix
 
@@ -297,7 +311,8 @@ Background children inherit `SIGINT = SIG_IGN` from the shell (appropriate for n
 ### Signal handling
 
 - The shell process ignores `SIGINT` and `SIGPIPE`.
-- Forked foreground children restore `SIGINT` and `SIGPIPE` to `SIG_DFL` before executing. This means Ctrl-C kills foreground children but not the shell itself, and broken pipes in pipeline children terminate normally.
+- While the line editor is active, the terminal has `ISIG` cleared, so Ctrl-C at the prompt never becomes a signal at all — the editor sees byte `0x03` and abandons the current line.
+- Forked foreground children restore `SIGINT` and `SIGPIPE` to `SIG_DFL` before executing (and run with the terminal restored to its original mode, `ISIG` included). This means Ctrl-C kills foreground children but not the shell itself, and broken pipes in pipeline children terminate normally.
 - Background children inherit `SIGINT = SIG_IGN` (the shell's disposition) and are reaped non-blocking at the top of each prompt loop.
 
 ### Built-in commands
@@ -465,15 +480,16 @@ These are generous enough for all real use cases and avoid the complexity of dyn
 A Bash test runner at the repo root covers all apps and the shell's pipeline executor:
 
 ```sh
-./test_apps.sh                    # run all 43 tests
+./test_apps.sh                    # run all 58 tests
 ./test_apps.sh --test N           # run a specific test by number
 ./test_apps.sh --test N --test M  # run multiple specific tests
 ```
 
-The runner has two execution modes:
+The runner has three execution modes:
 
 - **`run_test`** — invokes a binary directly, captures stdout+stderr, checks exit code, and optionally compares against an exact expected string.
 - **`run_mysh`** — writes a pipeline string to a temp script file and runs it through `mysh`. Displays the pipeline string (not the script path) so the log is readable.
+- **`run_pty_keys`** — drives an interactive `mysh` through a real pty (via a python3 helper): waits for the prompt, sends raw keystrokes (arrow-key escape sequences, control bytes), and asserts on the transcript. Used by the line-editor tests (54–58), which skip gracefully when python3 is unavailable.
 
 Exit code is 0 if all selected tests pass, 1 otherwise — suitable for use in a CI script.
 

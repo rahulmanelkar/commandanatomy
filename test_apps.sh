@@ -25,6 +25,7 @@
 #   48-49 @ mode        interactive NL prompt forwarded to AI mock, non-interactive skip
 #   50-52 fetch (robust) recv timeout (SO_RCVTIMEO), invalid port, oversized hostname
 #   53    fetch         connect timeout on an unreachable host (poll-based)
+#   54-58 linedit       arrow-key editing, Home/End/Delete, Ctrl-C, long-line scroll (pty)
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -123,7 +124,7 @@ finally:
 
 skip_no_python() {  # $1 = test num, $2 = desc
     printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" "$1" "$2"
-    printf "  ${YLW}SKIP${RST}  python3 not available (needed for a test TCP server)\n"
+    printf "  ${YLW}SKIP${RST}  python3 not available (needed for this test's TCP/pty harness)\n"
 }
 
 # ── counters ──────────────────────────────────────────────────────────────────
@@ -830,8 +831,120 @@ t_53() {
     fi
 }
 
+# ── 54-58: interactive line editing (raw-mode editor driven through a pty) ───
+
+# run_pty_keys NUM DESC KEYS WANT [FORBID]
+#
+# Drives mysh interactively through a pty: waits for the first prompt (so the
+# raw-mode editor is active before any key arrives), sends KEYS (a bash $'...'
+# string, may contain escape sequences), then reads the transcript.  Passes
+# iff WANT appears in the transcript and FORBID (if given) does not.
+run_pty_keys() {
+    local num=$1 desc=$2 keys=$3 want=$4 forbid=${5-}
+
+    have_python || { skip_no_python "$num" "$desc"; return; }
+
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" "$num" "$desc"
+    printf "  ${DIM}[mysh pty] keys: %q${RST}\n" "$keys"
+
+    local out code
+    out=$(python3 - "$keys" "$want" "$forbid" <<'PY' 2>&1
+import os, pty, select, signal, sys, time
+
+keys   = sys.argv[1].encode()
+want   = sys.argv[2].encode()
+forbid = sys.argv[3].encode() if len(sys.argv) > 3 and sys.argv[3] else None
+
+os.environ["TERM"] = "xterm"          # ensure the raw-mode editor engages
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("./shell/mysh", ["./shell/mysh"])
+    os._exit(127)
+
+def read_until(marker, deadline):
+    out = b""
+    while marker not in out and time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try: chunk = os.read(fd, 4096)
+            except OSError: break
+            if not chunk: break
+            out += chunk
+    return out
+
+deadline = time.time() + 10
+out = read_until(b"mysh> ", deadline)   # first prompt: editor is in control
+os.write(fd, keys)
+out += read_until(want, deadline)
+
+os.write(fd, b"exit\r")
+time.sleep(0.2)
+try: os.kill(pid, signal.SIGKILL)       # bound the test; harmless if gone
+except OSError: pass
+try: os.waitpid(pid, 0)
+except OSError: pass
+
+ok = want in out and (forbid is None or forbid not in out)
+if not ok:
+    sys.stderr.write("transcript tail: %r\n" % out[-300:])
+sys.exit(0 if ok else 1)
+PY
+) && code=0 || code=$?
+
+    if (( code == 0 )); then
+        printf "  ${GRN}PASS${RST}\n"
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  expected output missing (or forbidden output present)\n"
+        [[ -n "$out" ]] && printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
+t_54() {
+    # The headline feature: Left arrows walk the cursor back, the fix is
+    # inserted mid-line.  "echo hllo" + 3x Left + "e"  ->  echo hello
+    run_pty_keys 54 "linedit — Left arrows + insert mid-line" \
+        $'echo hllo\x1b[D\x1b[D\x1b[De\r' \
+        $'\r\nhello\r\n' \
+        $'\r\nhllo\r\n'
+}
+
+t_55() {
+    # Home jumps to column 0, Delete erases under the cursor.
+    # "xxecho hi" + Home + 2x Delete  ->  echo hi
+    run_pty_keys 55 "linedit — Home key + Delete key" \
+        $'xxecho hi\x1b[H\x1b[3~\x1b[3~\r' \
+        $'\r\nhi\r\n'
+}
+
+t_56() {
+    # vt-style Home (ESC[1~) + Right arrow + insert.
+    # "eho hello" + Home + Right + "c"  ->  echo hello
+    run_pty_keys 56 "linedit — vt Home + Right arrow + insert" \
+        $'eho hello\x1b[1~\x1b[Cc\r' \
+        $'\r\nhello\r\n'
+}
+
+t_57() {
+    # Ctrl-C abandons the line instead of running it; the next line runs.
+    run_pty_keys 57 "linedit — Ctrl-C abandons the current line" \
+        $'garbagecmd_zz\x03echo ok\r' \
+        $'\r\nok\r\n' \
+        'No such file'
+}
+
+t_58() {
+    # A line longer than the terminal scrolls horizontally in the editor;
+    # the buffer must survive intact.
+    run_pty_keys 58 "linedit — long line scrolls horizontally, content intact" \
+        $'echo '"$(printf 'x%.0s' {1..200})"$'\r' \
+        $'\r\n'"$(printf 'x%.0s' {1..200})"$'\r\n'
+}
+
 # ── registry & dispatch ───────────────────────────────────────────────────────
-ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53)
+ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58)
 
 # parse --test N flags; multiple --test flags accumulate
 SELECTED=()
