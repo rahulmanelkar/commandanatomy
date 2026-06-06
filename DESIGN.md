@@ -5,8 +5,9 @@
 rahulbox is a custom Unix shell ecosystem built in C. It consists of:
 
 1. **A set of reimplemented Unix utilities** (`ls`, `cat`, `wc`, `grep`, etc.), each built as both a standalone binary and a static library.
-2. **`mysh`** — a small Unix shell that runs the utility commands in-process (no fork) and falls back to `fork` + `execvp` for everything else on `PATH`.
+2. **`mysh`** — a small Unix shell that runs the utility commands in-process (no fork) and falls back to `fork` + `execvp` for everything else on `PATH`. It also offers a natural-language `@` prefix that forwards a prompt to a local AI mock server.
 3. **`pkg`** — a local package manager for installing shell extensions.
+4. **`fetch`** — a TCP line client used both standalone and as the transport behind the shell's `@` prefix.
 
 The central design idea is the **Command Anatomy**: a shared `cmd_spec_t` struct that unifies argument parsing, help text generation, and shell registration across every command in the ecosystem.
 
@@ -178,16 +179,28 @@ The root Makefile lists only the original five apps explicitly (it predates the 
 
 ### Architecture
 
-`mysh` is a single-file shell (`mysh.c`, ~530 lines). Its main loop:
+`mysh` is a single-file shell (`mysh.c`, ~770 lines). Its main loop:
 
 1. Reap finished background jobs with `waitpid(-1, NULL, WNOHANG)`
 2. Print prompt if interactive
-3. `fgets` one line
-4. Tokenize via `tok_split` (expands `$VAR`/`${VAR}`/`$?` in place)
-5. Strip a trailing `&` token and set a `bg` flag if present
-6. Parse pipeline stages via `parse_pipeline`
-7. Handle built-ins (`cd`, `exit`, `help`, `VAR=value`) for single-stage commands
-8. Execute via `run_pipeline`; if `bg`, fork the whole pipeline and continue
+3. `fgets` one line, strip the trailing newline
+4. **Natural-language `@` prefix** — if the first non-whitespace character is `@`, forward the rest of the line to the AI mock server and skip the normal path (see below)
+5. Tokenize via `tok_split` (expands `$VAR`/`${VAR}`/`$?` in place)
+6. Strip a trailing `&` token and set a `bg` flag if present
+7. Parse pipeline stages via `parse_pipeline`
+8. Handle built-ins (`cd`, `exit`, `help`, `VAR=value`) for single-stage commands
+9. Execute via `run_pipeline`; if `bg`, fork the whole pipeline and continue
+
+### Natural-language `@` prefix
+
+The `@` check sits between reading the line and tokenizing it, so an `@` line never reaches the tokenizer or pipeline parser. After skipping leading whitespace, if the first character is `@` the shell:
+
+1. Skips the `@` and any following spaces, then strips one optional pair of surrounding quotes (`@ "list files"` → `list files`).
+2. If non-interactive (script file or piped stdin), prints a notice to stderr and skips the line with `last_status = 0` — natural-language mode is an interactive convenience, so non-interactive runs stay offline and deterministic.
+3. If the prompt is empty, reports an error and sets `last_status = 1`.
+4. Otherwise calls `run_at_prompt()`, which **reuses the `fetch` command's logic in-process** — it builds `argv` as `fetch -H AI_HOST -p AI_PORT -- <prompt>` and calls `cmd_fetch_spec.run(...)` directly (no fork, no second parse). The `--` guards prompts that begin with `-`; `fetch` writes the server's reply straight to the shell's `out_stream`.
+
+`AI_HOST`/`AI_PORT` are `#define`d in `mysh.c` (default `localhost:5001`). Any line server that reads a newline-terminated request and replies with a line is a valid backend — `fetch`'s 5s connect/recv timeouts mean an unreachable or silent endpoint fails gracefully rather than hanging the prompt. This is the in-process-reuse pattern taken one step further: instead of registering `fetch` and dispatching by name, the shell calls another command's `run()` entrypoint directly to compose a new feature.
 
 ### Tokenizer (`tok.c`)
 
