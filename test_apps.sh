@@ -24,6 +24,7 @@
 #   44-47 fetch         TCP line round-trip, --json schema, refused error, mysh built-in
 #   48-49 @ mode        interactive NL prompt forwarded to AI mock, non-interactive skip
 #   50-52 fetch (robust) recv timeout (SO_RCVTIMEO), invalid port, oversized hostname
+#   53    fetch         connect timeout on an unreachable host (poll-based)
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -792,8 +793,45 @@ t_52() {
     fi
 }
 
+t_53() {
+    # connect() must be bounded too: a routable-but-unreachable host (the SYN is
+    # silently dropped) makes connect() hang until fetch's 5s connect timeout
+    # fires.  192.0.2.1 is TEST-NET-1 (RFC 5737), reserved and not reachable.
+    #
+    # This is environment-dependent: if the local network rejects the address
+    # quickly (no route / unreachable) instead of blackholing it, the timeout
+    # can't be exercised — that's a SKIP, not a failure of fetch.
+    local host=192.0.2.1
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 53 "fetch — trips 5s connect timeout on an unreachable host"
+    printf "  ${DIM}\$ ./apps/fetch/fetch -H %s -p 80 hi${RST}\n" "$host"
+
+    local start end elapsed out code
+    start=$(date +%s)
+    out=$(timeout 20 ./apps/fetch/fetch -H "$host" -p 80 hi 2>&1); code=$?
+    end=$(date +%s); elapsed=$(( end - start ))
+
+    if (( code == 124 )); then
+        printf "  ${RED}FAIL${RST}  fetch hung — connect timeout did not fire (>20s)\n"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    elif (( code != 0 )) && (( elapsed >= 4 && elapsed <= 9 )) \
+         && printf '%s' "$out" | grep -qi "connect" && printf '%s' "$out" | grep -qi "tim"; then
+        printf "  ${GRN}PASS${RST}  (exit=%d, ~%ds)\n" "$code" "$elapsed"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    elif (( elapsed < 4 )); then
+        printf "  ${YLW}SKIP${RST}  network rejected %s in %ds (no blackhole route) — "
+        printf "cannot exercise the connect timeout here\n" "$host" "$elapsed"
+        printf "%s\n" "$out" | sed 's/^/    /'
+    else
+        printf "  ${RED}FAIL${RST}  expected a ~5s connect timeout (got exit=%d, %ds)\n" "$code" "$elapsed"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
 # ── registry & dispatch ───────────────────────────────────────────────────────
-ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52)
+ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53)
 
 # parse --test N flags; multiple --test flags accumulate
 SELECTED=()
