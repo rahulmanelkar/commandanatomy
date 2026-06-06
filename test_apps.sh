@@ -23,6 +23,7 @@
 #   37-43 BNF shell lab VAR=value assignment, $VAR/$?/${VAR} expansion, & background
 #   44-47 fetch         TCP line round-trip, --json schema, refused error, mysh built-in
 #   48-49 @ mode        interactive NL prompt forwarded to AI mock, non-interactive skip
+#   50-52 fetch (robust) recv timeout (SO_RCVTIMEO), invalid port, oversized hostname
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -85,6 +86,35 @@ finally:
 ' "$port" "$ready" &
     SERVER_PID=$!
     # Wait until the server has bound+listened (ready file appears), max ~2s.
+    local i=0
+    while [[ ! -e "$ready" ]] && (( i < 100 )); do sleep 0.02; (( i++ )); done
+    rm -f "$ready"
+}
+
+# start_silent_server spins up a peer that ACCEPTS a connection but never sends
+# any data, holding it open well past fetch's 5s SO_RCVTIMEO — so the client
+# must trip its receive timeout.  Sets SERVER_PID for the caller to kill/wait.
+start_silent_server() {  # $1 = port
+    local port=$1 ready
+    ready=$(mktemp /tmp/rb_ready_XXXXXX); rm -f "$ready"
+    python3 -c '
+import socket, sys, time
+port = int(sys.argv[1]); readyfile = sys.argv[2]
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port)); s.listen(1)
+s.settimeout(15)               # bounded so the helper can never wedge the suite
+open(readyfile, "w").close()
+try:
+    c, _ = s.accept()
+    time.sleep(8)              # hold the connection open, send nothing
+    c.close()
+except Exception:
+    pass
+finally:
+    s.close()
+' "$port" "$ready" &
+    SERVER_PID=$!
     local i=0
     while [[ ! -e "$ready" ]] && (( i < 100 )); do sleep 0.02; (( i++ )); done
     rm -f "$ready"
@@ -692,8 +722,78 @@ t_49() {
     fi
 }
 
+# fetch robustness: timeout + input validation ───────────────────────────────
+# (Happy-path line-protocol round-trip is test 44; refused error is test 46.)
+
+t_50() {
+    have_python || { skip_no_python 50 "fetch — recv timeout (SO_RCVTIMEO)"; return; }
+    start_silent_server 54373
+
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 50 "fetch — trips 5s recv timeout on a silent peer"
+    printf "  ${DIM}\$ ./apps/fetch/fetch -H 127.0.0.1 -p 54373 ping${RST}\n"
+
+    # Peer accepts but sends nothing.  fetch must trip SO_RCVTIMEO (~5s) and
+    # exit non-zero — not hang (timeout 20 guards the suite; exit 124 = hung).
+    local start end elapsed out code
+    start=$(date +%s)
+    out=$(timeout 20 ./apps/fetch/fetch -H 127.0.0.1 -p 54373 ping 2>&1); code=$?
+    end=$(date +%s); elapsed=$(( end - start ))
+
+    kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+
+    if (( code != 0 )) && (( code != 124 )) && (( elapsed >= 4 && elapsed <= 9 )) \
+       && printf '%s' "$out" | grep -qi "tim"; then
+        printf "  ${GRN}PASS${RST}  (exit=%d, ~%ds)\n" "$code" "$elapsed"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  expected non-zero exit near 5s with a timeout message "
+        printf "(got exit=%d, %ds)\n" "$code" "$elapsed"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
+t_51() {
+    # Out-of-range port must fail validation immediately (before any connect)
+    # with exit 1 — no hang, no network.
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 51 "fetch — invalid port (999999) rejected by bounds check"
+    printf "  ${DIM}\$ ./apps/fetch/fetch -H 127.0.0.1 -p 999999 hi${RST}\n"
+
+    local out code
+    out=$(timeout 10 ./apps/fetch/fetch -H 127.0.0.1 -p 999999 hi 2>&1); code=$?
+
+    if (( code == 1 )) && printf '%s' "$out" | grep -qi "port"; then
+        printf "  ${GRN}PASS${RST}\n"; printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  expected exit 1 and a 'port' validation message (got exit=%d)\n" "$code"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
+t_52() {
+    # Over-sized hostname (> 255 chars) must fail validation immediately, exit 1.
+    local longhost; longhost=$(printf 'a%.0s' {1..300})
+    printf "\n${BLD}Test %-3s${RST}  ${CYN}%s${RST}\n" 52 "fetch — oversized hostname rejected by bounds check"
+    printf "  ${DIM}\$ ./apps/fetch/fetch -H <300-char host> -p 80 hi${RST}\n"
+
+    local out code
+    out=$(timeout 10 ./apps/fetch/fetch -H "$longhost" -p 80 hi 2>&1); code=$?
+
+    if (( code == 1 )) && printf '%s' "$out" | grep -qi "host"; then
+        printf "  ${GRN}PASS${RST}\n"; printf "%s\n" "$out" | sed 's/^/    /'
+        N_PASS=$(( N_PASS + 1 ))
+    else
+        printf "  ${RED}FAIL${RST}  expected exit 1 and a 'host' validation message (got exit=%d)\n" "$code"
+        printf "%s\n" "$out" | sed 's/^/    /'
+        N_FAIL=$(( N_FAIL + 1 ))
+    fi
+}
+
 # ── registry & dispatch ───────────────────────────────────────────────────────
-ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49)
+ALL_TESTS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52)
 
 # parse --test N flags; multiple --test flags accumulate
 SELECTED=()
