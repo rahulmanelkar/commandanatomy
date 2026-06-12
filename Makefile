@@ -1,4 +1,4 @@
-APPS = hello ls stat wc cat mkdir
+APPS = hello ls stat wc cat mkdir ftpd
 
 .PHONY: all clean shell $(APPS)
 

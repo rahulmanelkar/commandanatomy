@@ -22,7 +22,8 @@ APP_OBJS = ../apps/hello/cmd_hello.o \
            ../apps/tee/cmd_tee.o     \
            ../apps/pkg/cmd_pkg.o     \
            ../apps/fetch/cmd_fetch.o \
-           ../apps/mkdir/cmd_mkdir.o
+           ../apps/mkdir/cmd_mkdir.o \
+           ../apps/ftpd/cmd_ftpd.o
 
 .PHONY: all clean apps
 
@@ -45,6 +46,7 @@ apps:
 	$(MAKE) -C ../apps/pkg
 	$(MAKE) -C ../apps/fetch
 	$(MAKE) -C ../apps/mkdir
+	$(MAKE) -C ../apps/ftpd
 
 mysh: mysh.o tok.o linedit.o argtable3.o $(APP_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
