@@ -34,6 +34,16 @@ typedef struct {
     int timeout;              /* idle seconds on the control channel; 0 = none */
 } conn_ctx_t;
 
+/* Per-session data channel. A transfer is served either actively (connect back
+ * to a PORT address) or passively (accept on a listening socket opened by PASV).
+ * Lives on the worker's stack, so each client's channel is independent. */
+typedef struct {
+    int                pasv_fd;     /* passive listening socket, or -1 */
+    int                have_port;   /* 1 once a valid PORT address is set */
+    struct sockaddr_in port_addr;   /* active-mode target (from PORT) */
+    int                timeout;     /* seconds; bounds a passive accept() */
+} datachan_t;
+
 /* --------------------------------------------------------------------------
  * argtable3 builder — single source of truth for parsing and help output
  * -------------------------------------------------------------------------- */
@@ -145,6 +155,84 @@ static void str_upper(char *s)
 }
 
 /* --------------------------------------------------------------------------
+ * data channel — active (PORT) or passive (PASV)
+ * -------------------------------------------------------------------------- */
+
+/* True if a data channel has been armed by a prior PORT or PASV. */
+static int datachan_armed(const datachan_t *dc)
+{
+    return dc->pasv_fd >= 0 || dc->have_port;
+}
+
+/* Close any armed-but-unused data channel (e.g. a stale PASV listener). */
+static void datachan_reset(datachan_t *dc)
+{
+    if (dc->pasv_fd >= 0) { close(dc->pasv_fd); dc->pasv_fd = -1; }
+    dc->have_port = 0;
+}
+
+/* Establish the actual data connection and consume the channel. In passive mode
+ * this accept()s on the PASV listener; in active mode it connect()s to the PORT
+ * address. Returns the connected data fd, or -1. */
+static int datachan_open(datachan_t *dc)
+{
+    int fd = -1;
+    if (dc->pasv_fd >= 0) {
+        fd = accept(dc->pasv_fd, NULL, NULL);
+        close(dc->pasv_fd);
+        dc->pasv_fd = -1;
+    } else if (dc->have_port) {
+        fd = data_connect(&dc->port_addr);
+    }
+    dc->have_port = 0;          /* a PORT/PASV applies to a single transfer */
+    return fd;
+}
+
+/* PASV: open an ephemeral listening socket on the same local IP the client
+ * reached us on, and advertise it as h1,h2,h3,h4,p1,p2 in a 227 reply. */
+static void handle_pasv(int ctl, datachan_t *dc)
+{
+    datachan_reset(dc);         /* drop any previously armed channel */
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { ctl_reply(ctl, "425 Can't open data connection.\r\n"); return; }
+
+    /* Bind to the control connection's local address, so the advertised IP is
+     * necessarily one the client can reach; let the kernel pick the port. */
+    struct sockaddr_in local;
+    socklen_t          llen = sizeof local;
+    if (getsockname(ctl, (struct sockaddr *)&local, &llen) < 0) {
+        close(lfd); ctl_reply(ctl, "425 Can't open data connection.\r\n"); return;
+    }
+    local.sin_port = 0;
+
+    if (bind(lfd, (struct sockaddr *)&local, sizeof local) < 0 || listen(lfd, 1) < 0) {
+        close(lfd); ctl_reply(ctl, "425 Can't open data connection.\r\n"); return;
+    }
+
+    struct sockaddr_in bound;
+    socklen_t          blen = sizeof bound;
+    if (getsockname(lfd, (struct sockaddr *)&bound, &blen) < 0) {
+        close(lfd); ctl_reply(ctl, "425 Can't open data connection.\r\n"); return;
+    }
+
+    if (dc->timeout > 0) {       /* bound the eventual accept() so it can't hang */
+        struct timeval tv = { .tv_sec = dc->timeout, .tv_usec = 0 };
+        setsockopt(lfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
+    dc->pasv_fd = lfd;
+
+    uint32_t ip   = ntohl(local.sin_addr.s_addr);
+    uint16_t port = ntohs(bound.sin_port);
+    char reply[CTL_LINE_MAX];
+    snprintf(reply, sizeof reply,
+             "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u).\r\n",
+             (ip >> 24) & 0xffu, (ip >> 16) & 0xffu, (ip >> 8) & 0xffu, ip & 0xffu,
+             (port >> 8) & 0xffu, port & 0xffu);
+    ctl_reply(ctl, reply);
+}
+
+/* --------------------------------------------------------------------------
  * command handlers — these reuse the ls/mkdir specs by reference
  * -------------------------------------------------------------------------- */
 
@@ -182,14 +270,16 @@ static void handle_mkd(int ctl, const char *path)
 
 /* LIST: open the data connection, hand the socket to cmd_ls_spec.run as its
  * out_stream, flush+close, then report 226 on the control channel. */
-static void handle_list(int ctl, int have_port, const struct sockaddr_in *data_addr)
+static void handle_list(int ctl, datachan_t *dc)
 {
-    if (!have_port) { ctl_reply(ctl, "425 Use PORT first.\r\n"); return; }
+    if (!datachan_armed(dc)) { ctl_reply(ctl, "425 Use PORT or PASV first.\r\n"); return; }
 
-    int dfd = data_connect(data_addr);
-    if (dfd < 0) { ctl_reply(ctl, "425 Can't open data connection.\r\n"); return; }
-
+    /* 150 must precede the accept()/connect() so a passive client that waits for
+     * 150 before finishing its side of the data connection can't deadlock. */
     ctl_reply(ctl, "150 Here comes the directory listing.\r\n");
+
+    int dfd = datachan_open(dc);
+    if (dfd < 0) { ctl_reply(ctl, "426 Can't open data connection.\r\n"); return; }
 
     FILE *dout = fdopen(dfd, "w");
     if (dout) {
@@ -205,18 +295,21 @@ static void handle_list(int ctl, int have_port, const struct sockaddr_in *data_a
 }
 
 /* RETR: stream a file out to the data connection. Byte-count I/O => NUL-safe. */
-static void handle_retr(int ctl, int have_port,
-                        const struct sockaddr_in *data_addr, const char *path)
+static void handle_retr(int ctl, datachan_t *dc, const char *path)
 {
-    if (!have_port) { ctl_reply(ctl, "425 Use PORT first.\r\n"); return; }
+    if (!datachan_armed(dc)) { ctl_reply(ctl, "425 Use PORT or PASV first.\r\n"); return; }
 
     int ffd = open(path, O_RDONLY);
-    if (ffd < 0) { ctl_reply(ctl, "550 File not found or not accessible.\r\n"); return; }
-
-    int dfd = data_connect(data_addr);
-    if (dfd < 0) { close(ffd); ctl_reply(ctl, "425 Can't open data connection.\r\n"); return; }
+    if (ffd < 0) {
+        datachan_reset(dc);                 /* abandon the armed channel */
+        ctl_reply(ctl, "550 File not found or not accessible.\r\n");
+        return;
+    }
 
     ctl_reply(ctl, "150 Opening BINARY mode data connection.\r\n");
+
+    int dfd = datachan_open(dc);
+    if (dfd < 0) { close(ffd); ctl_reply(ctl, "426 Can't open data connection.\r\n"); return; }
 
     char    buf[XFER_BUF];
     int     ok = 1;
@@ -232,18 +325,21 @@ static void handle_retr(int ctl, int have_port,
 }
 
 /* STOR: stream from the data connection into a file. NUL-safe by construction. */
-static void handle_stor(int ctl, int have_port,
-                        const struct sockaddr_in *data_addr, const char *path)
+static void handle_stor(int ctl, datachan_t *dc, const char *path)
 {
-    if (!have_port) { ctl_reply(ctl, "425 Use PORT first.\r\n"); return; }
+    if (!datachan_armed(dc)) { ctl_reply(ctl, "425 Use PORT or PASV first.\r\n"); return; }
 
     int ffd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (ffd < 0) { ctl_reply(ctl, "550 Cannot create file.\r\n"); return; }
-
-    int dfd = data_connect(data_addr);
-    if (dfd < 0) { close(ffd); ctl_reply(ctl, "425 Can't open data connection.\r\n"); return; }
+    if (ffd < 0) {
+        datachan_reset(dc);                 /* abandon the armed channel */
+        ctl_reply(ctl, "550 Cannot create file.\r\n");
+        return;
+    }
 
     ctl_reply(ctl, "150 Ok to send data.\r\n");
+
+    int dfd = datachan_open(dc);
+    if (dfd < 0) { close(ffd); ctl_reply(ctl, "426 Can't open data connection.\r\n"); return; }
 
     char    buf[XFER_BUF];
     int     ok = 1;
@@ -268,10 +364,11 @@ static void *ConnectionHandler(void *arg)
     int ctl = ctx->ctl_fd;
 
     /* Session state — entirely on this thread's stack, isolated per client. */
-    int                logged_in = 0;
-    int                have_port = 0;
-    struct sockaddr_in data_addr;
-    memset(&data_addr, 0, sizeof data_addr);
+    int        logged_in = 0;
+    datachan_t dc;
+    memset(&dc, 0, sizeof dc);
+    dc.pasv_fd = -1;
+    dc.timeout = ctx->timeout;
 
     if (ctx->timeout > 0) {
         struct timeval tv = { .tv_sec = ctx->timeout, .tv_usec = 0 };
@@ -309,29 +406,34 @@ static void *ConnectionHandler(void *arg)
         } else if (!logged_in) {
             ctl_reply(ctl, "530 Not logged in.\r\n");
         } else if (strcmp(verb, "PORT") == 0) {
-            if (arg && parse_port(arg, &data_addr) == 0) {
-                have_port = 1;
+            if (arg && parse_port(arg, &dc.port_addr) == 0) {
+                if (dc.pasv_fd >= 0) { close(dc.pasv_fd); dc.pasv_fd = -1; }  /* drop stale PASV */
+                dc.have_port = 1;
                 ctl_reply(ctl, "200 PORT command successful.\r\n");
             } else {
                 ctl_reply(ctl, "501 Syntax error in parameters.\r\n");
             }
+        } else if (strcmp(verb, "PASV") == 0) {
+            handle_pasv(ctl, &dc);
         } else if (strcmp(verb, "MKD") == 0) {
             if (arg && *arg) handle_mkd(ctl, arg);
             else             ctl_reply(ctl, "501 Syntax error in parameters.\r\n");
-        } else if (strcmp(verb, "LIST") == 0) {
-            handle_list(ctl, have_port, &data_addr);
-            have_port = 0;             /* a PORT applies to one transfer */
+        } else if (strcmp(verb, "LIST") == 0 || strcmp(verb, "NLST") == 0) {
+            handle_list(ctl, &dc);
         } else if (strcmp(verb, "RETR") == 0) {
-            if (arg && *arg) { handle_retr(ctl, have_port, &data_addr, arg); have_port = 0; }
+            if (arg && *arg) handle_retr(ctl, &dc, arg);
             else             ctl_reply(ctl, "501 Syntax error in parameters.\r\n");
         } else if (strcmp(verb, "STOR") == 0) {
-            if (arg && *arg) { handle_stor(ctl, have_port, &data_addr, arg); have_port = 0; }
+            if (arg && *arg) handle_stor(ctl, &dc, arg);
             else             ctl_reply(ctl, "501 Syntax error in parameters.\r\n");
+        } else if (strcmp(verb, "PWD") == 0 || strcmp(verb, "XPWD") == 0) {
+            ctl_reply(ctl, "257 \"/\" is the current directory.\r\n");
         } else {
             ctl_reply(ctl, "502 Command not implemented.\r\n");
         }
     }
 
+    datachan_reset(&dc);    /* close any passive listener still open */
     close(ctl);
     free(ctx);
     return NULL;
@@ -486,9 +588,11 @@ cmd_spec_t cmd_ftpd_spec = {
     .summary    = "multi-threaded active-mode FTP server",
     .long_help  = "Serve the current working directory over a minimal, multi-threaded "
                   "FTP daemon. Each client is handled on its own detached pthread with "
-                  "stack-isolated session state. Supports USER, QUIT, PORT, LIST, MKD, "
-                  "RETR and STOR; LIST and MKD reuse the in-process ls and mkdir command "
-                  "specs. Data transfers use active mode (PORT) and are binary-safe.",
+                  "stack-isolated session state. Supports USER, QUIT, PORT, PASV, LIST, "
+                  "NLST, MKD, RETR and STOR; LIST and MKD reuse the in-process ls and "
+                  "mkdir command specs. Both active (PORT) and passive (PASV) data "
+                  "connections work, so standard FTP clients (ftp, curl) connect "
+                  "out-of-the-box. Transfers are binary-safe.",
     .run         = ftpd_run,
     .print_usage = ftpd_print_usage,
 };
