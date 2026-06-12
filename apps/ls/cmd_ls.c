@@ -49,12 +49,41 @@ static const char *entry_type(mode_t m)
     return "file";
 }
 
+/* Escape a string into a JSON string body: double quotes, backslashes, and
+ * control characters (incl. newline/CR/tab). Prevents a crafted filename from
+ * breaking out of the JSON structure or injecting a payload when a listing is
+ * streamed to a remote agent. */
+static void json_escape(FILE *out, const char *s, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        if      (ch == '"')  fputs("\\\"", out);
+        else if (ch == '\\') fputs("\\\\", out);
+        else if (ch == '\n') fputs("\\n",  out);
+        else if (ch == '\r') fputs("\\r",  out);
+        else if (ch == '\t') fputs("\\t",  out);
+        else if (ch < 0x20)  fprintf(out, "\\u%04x", ch);
+        else                 fputc(ch, out);
+    }
+}
+
+/* Thread-safe strerror. With -D_GNU_SOURCE the GNU strerror_r returns a
+ * pointer that may or may not be `buf`, so the return value must be used (not
+ * `buf`). The caller supplies a stack-local buffer so concurrent clients never
+ * race on the static buffer that plain strerror() would share. */
+static const char *errstr(int errnum, char *buf, size_t buflen)
+{
+    return strerror_r(errnum, buf, buflen);
+}
+
 /* List one directory in plain text. Returns 0 on success, 1 on error. */
 static int list_dir_plain(FILE *out, const char *path, int show_all)
 {
     DIR *dp = opendir(path);
     if (!dp) {
-        fprintf(stderr, "ls: cannot open '%s': %s\n", path, strerror(errno));
+        char ebuf[128];
+        fprintf(stderr, "ls: cannot open '%s': %s\n",
+                path, errstr(errno, ebuf, sizeof ebuf));
         return 1;
     }
     struct dirent *ent;
@@ -72,11 +101,15 @@ static int list_dir_json(FILE *out, const char *path, int show_all)
 {
     DIR *dp = opendir(path);
     if (!dp) {
-        fprintf(stderr, "ls: cannot open '%s': %s\n", path, strerror(errno));
+        char ebuf[128];
+        fprintf(stderr, "ls: cannot open '%s': %s\n",
+                path, errstr(errno, ebuf, sizeof ebuf));
         return 1;
     }
 
-    fprintf(out, "{\n  \"path\": \"%s\",\n  \"entries\": [\n", path);
+    fprintf(out, "{\n  \"path\": \"");
+    json_escape(out, path, strlen(path));
+    fprintf(out, "\",\n  \"entries\": [\n");
 
     struct dirent *ent;
     int first = 1;
@@ -96,8 +129,9 @@ static int list_dir_json(FILE *out, const char *path, int show_all)
         }
 
         if (!first) fprintf(out, ",\n");
-        fprintf(out, "    {\"name\": \"%s\", \"type\": \"%s\", \"size\": %lld}",
-               ent->d_name, type, size);
+        fprintf(out, "    {\"name\": \"");
+        json_escape(out, ent->d_name, strlen(ent->d_name));
+        fprintf(out, "\", \"type\": \"%s\", \"size\": %lld}", type, size);
         first = 0;
     }
 
@@ -125,9 +159,12 @@ static int list_file_json(FILE *out, const char *path)
     }
     const char *name = strrchr(path, '/');
     name = name ? name + 1 : path;
-    fprintf(out, "{\n  \"path\": \"%s\",\n  \"entries\": [\n", path);
-    fprintf(out, "    {\"name\": \"%s\", \"type\": \"%s\", \"size\": %lld}\n",
-           name, type, size);
+    fprintf(out, "{\n  \"path\": \"");
+    json_escape(out, path, strlen(path));
+    fprintf(out, "\",\n  \"entries\": [\n");
+    fprintf(out, "    {\"name\": \"");
+    json_escape(out, name, strlen(name));
+    fprintf(out, "\", \"type\": \"%s\", \"size\": %lld}\n", type, size);
     fprintf(out, "  ]\n}\n");
     return 0;
 }
@@ -207,7 +244,9 @@ int ls_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
         struct stat st;
 
         if (stat(p, &st) != 0) {
-            fprintf(stderr, "ls: cannot access '%s': %s\n", p, strerror(errno));
+            char ebuf[128];
+            fprintf(stderr, "ls: cannot access '%s': %s\n",
+                    p, errstr(errno, ebuf, sizeof ebuf));
             ret = 1;
             continue;
         }
