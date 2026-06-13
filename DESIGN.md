@@ -5,7 +5,7 @@
 rahulbox is a custom Unix shell ecosystem built in C. It consists of:
 
 1. **A set of reimplemented Unix utilities** (`ls`, `cat`, `wc`, `grep`, etc.), each built as both a standalone binary and a static library.
-2. **`mysh`** — a small Unix shell that runs the utility commands in-process (no fork) and falls back to `fork` + `execvp` for everything else on `PATH`. It also offers a natural-language `@` prefix that forwards a prompt to a local AI mock server.
+2. **`mysh`** — a small Unix shell that runs the utility commands in-process (no fork) and falls back to `fork` + `execvp` for everything else on `PATH`. It also offers a natural-language `@` prefix that forwards a prompt to a local AI gateway.
 3. **`pkg`** — a local package manager for installing shell extensions.
 4. **`fetch`** — a TCP line client used both standalone and as the transport behind the shell's `@` prefix.
 
@@ -125,6 +125,12 @@ Every command implements `--json` for agent and MCP integration. The convention:
 
 ---
 
+### Command catalog export (`mysh --commands-json`)
+
+The shell exposes the whole registry as a machine-readable **tool catalog** via a boot-time global flag. `mysh --commands-json` walks `registry[0..registry_n-1]` and, for each `cmd_spec_t`, prints `{ "name", "summary", "usage": [...] }` as one top-level JSON array, then exits `0` — bypassing the interactive loop entirely.
+
+The `usage` lines are captured by running each command's own `print_usage()` into an `open_memstream` buffer (so the catalog *is* the `argtable3` help, never a parallel copy), split on newlines, and JSON-escaped (control characters + interior quotes) so external tooling ingests them with `json.loads()`. This is the discovery half of an MCP contract: an agent reads it once to learn every command and its options. `ai_gateway.py` consumes it to build the model's allowed vocabulary, so the catalog and the AI's toolset never drift from the binary.
+
 ## Build system
 
 ### Per-app Makefile
@@ -184,7 +190,7 @@ The root Makefile lists only the original five apps explicitly (it predates the 
 
 1. Reap finished background jobs with `waitpid(-1, NULL, WNOHANG)`
 2. Read one line — interactive: prompt + raw-mode line editor (`linedit_read`); script/piped input: plain `fgets` — and strip the trailing newline
-3. **Natural-language `@` prefix** — if the first non-whitespace character is `@`, forward the rest of the line to the AI mock server and skip the normal path (see below)
+3. **Natural-language `@` prefix** — if the first non-whitespace character is `@`, forward the rest of the line to the AI gateway and skip the normal path (see below)
 4. Tokenize via `tok_split` (expands `$VAR`/`${VAR}`/`$?` in place)
 5. Strip a trailing `&` token and set a `bg` flag if present
 6. Parse pipeline stages via `parse_pipeline`
@@ -212,7 +218,11 @@ The `@` check sits between reading the line and tokenizing it, so an `@` line ne
 1. Skips the `@` and any following spaces, then strips one optional pair of surrounding quotes (`@ "list files"` → `list files`).
 2. If non-interactive (script file or piped stdin), prints a notice to stderr and skips the line with `last_status = 0` — natural-language mode is an interactive convenience, so non-interactive runs stay offline and deterministic.
 3. If the prompt is empty, reports an error and sets `last_status = 1`.
-4. Otherwise calls `run_at_prompt()`, which **reuses the `fetch` command's logic in-process** — it builds `argv` as `fetch -H AI_HOST -p AI_PORT -- <prompt>` and calls `cmd_fetch_spec.run(...)` directly (no fork, no second parse). The `--` guards prompts that begin with `-`; `fetch` writes the server's reply straight to the shell's `out_stream`.
+4. Otherwise calls `run_at_prompt()`, a **Suggest → Confirm → Execute** pipeline:
+   - **Suggest** — `ai_query()` reuses the `fetch` command's logic in-process (builds `argv` as `fetch -H AI_HOST -p AI_PORT -- <prompt>` and calls `cmd_fetch_spec.run(...)` directly — no fork, no second parse; `--` guards prompts beginning with `-`), but redirects `fetch`'s `out_stream` into an `open_memstream` buffer so the reply is **captured, not printed**.
+   - **Confirm** — the suggestion is echoed under a `mysh (AI Suggestion)>` banner and `linedit_read()` gates on `Execute this command? [y/N]:` (reusing `linedit_read` keeps raw/cooked terminal handling consistent).
+   - **Execute** — on `y`/`Y`, the exact captured line runs through the normal engine: `tok_split()` → `parse_pipeline()` → `run_pipeline()`. Any other key, a bare Enter, or EOF prints `Aborted.` and returns 1.
+   - **Fallback** — if `fetch` exits non-zero (gateway unreachable) or returns no usable command, the gate is skipped and `ai_fallback_hint()` prints a deterministic offline hint keyed off prompt keywords. Replies beginning with `rahulbox AI` (the gateway's own error namespace) are treated as no-command.
 
 `AI_HOST`/`AI_PORT` are `#define`d in `mysh.c` (default `localhost:5001`). Any line server that reads a newline-terminated request and replies with a line is a valid backend — `fetch`'s 5s connect/recv timeouts mean an unreachable or silent endpoint fails gracefully rather than hanging the prompt. This is the in-process-reuse pattern taken one step further: instead of registering `fetch` and dispatching by name, the shell calls another command's `run()` entrypoint directly to compose a new feature.
 
