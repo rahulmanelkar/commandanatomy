@@ -633,22 +633,81 @@ static void setup_path(void)
     setenv("PATH", new_path, 1);
 }
 
-/*
- * Forward a natural-language prompt to the AI mock endpoint by reusing the
- * fetch command's logic in-process (cmd_fetch_spec.run) — no fork, no second
- * parse.  The prompt becomes fetch's MESSAGE positional; the "--" guards
- * prompts that happen to start with '-'.  fetch writes the server's reply to
- * out_stream itself, so the suggestion lands cleanly on the user's stream.
+/* ── '@' natural-language mode: Suggest → Confirm → Execute ──────────────────
  *
- * If $RAHULBOX_AI_TIMEOUT is set, its value is forwarded as fetch's `-t SECS`
- * so a slow LLM gateway gets more than the 5s default; fetch validates it and
- * reports any out-of-range value. Returns fetch's exit code.
- */
-static int run_at_prompt(const char *prompt, FILE *in, FILE *out)
+ * contains_ci: case-insensitive substring test used only by the offline
+ * heuristic below. */
+static int contains_ci(const char *hay, const char *needle)
 {
-    const char *timeout = getenv(AI_TIMEOUT_ENV);
+    size_t nl = strlen(needle);
+    if (nl == 0) return 1;
+    for (const char *h = hay; *h; h++) {
+        size_t i = 0;
+        while (i < nl && tolower((unsigned char)h[i]) ==
+                         tolower((unsigned char)needle[i]))
+            i++;
+        if (i == nl) return 1;
+    }
+    return 0;
+}
 
-    /* fetch -H HOST -p PORT [-t SECS] -- PROMPT : at most 9 args + NULL. */
+/*
+ * Deterministic, offline fallback for when the AI gateway can't be reached.
+ * Maps a few keywords in the prompt to a suggested rahulbox pipeline so the
+ * user still gets a useful pointer with no network round-trip. Never executes
+ * anything — without the gateway there is nothing trustworthy to confirm, so we
+ * only print a hint.
+ */
+static void ai_fallback_hint(const char *prompt, FILE *out)
+{
+    const char *hint;
+    if      (contains_ci(prompt, "count") || contains_ci(prompt, "how many"))
+        hint = "wc FILE";
+    else if (contains_ci(prompt, "search") || contains_ci(prompt, "find") ||
+             contains_ci(prompt, "contain") || contains_ci(prompt, "match") ||
+             contains_ci(prompt, "grep"))
+        hint = "grep PATTERN FILE   (or: cat FILE | grep PATTERN)";
+    else if (contains_ci(prompt, "sort"))
+        hint = "sort FILE   (add | uniq to drop duplicates)";
+    else if (contains_ci(prompt, "first") || contains_ci(prompt, "head") ||
+             contains_ci(prompt, "top"))
+        hint = "head FILE";
+    else if (contains_ci(prompt, "last") || contains_ci(prompt, "tail") ||
+             contains_ci(prompt, "end"))
+        hint = "tail FILE";
+    else if (contains_ci(prompt, "show") || contains_ci(prompt, "read") ||
+             contains_ci(prompt, "print") || contains_ci(prompt, "content") ||
+             contains_ci(prompt, "cat"))
+        hint = "cat FILE";
+    else if (contains_ci(prompt, "list") || contains_ci(prompt, "file") ||
+             contains_ci(prompt, "dir"))
+        hint = "ls   (add -a to include hidden entries)";
+    else
+        hint = "help   (lists every command rahulbox can run)";
+
+    fprintf(out, "mysh (offline hint)> %s\n", hint);
+    fflush(out);
+}
+
+/*
+ * Ask the gateway: run fetch in-process with its reply captured into a heap
+ * buffer (open_memstream) instead of printed. fetch reports transport failures
+ * on stderr and returns non-zero, so the return code distinguishes a real reply
+ * from a dead connection. *out_reply receives a trimmed, NUL-terminated copy
+ * (caller frees; may be empty/NULL). The "--" guards prompts starting with '-';
+ * $RAHULBOX_AI_TIMEOUT, if set, becomes fetch's -t SECS. Returns fetch's code,
+ * or -1 if the capture buffer could not be created.
+ */
+static int ai_query(const char *prompt, FILE *in, char **out_reply)
+{
+    *out_reply = NULL;
+
+    char  *buf  = NULL;
+    size_t size = 0;
+    FILE  *cap  = open_memstream(&buf, &size);
+    if (!cap) return -1;
+
+    const char *timeout = getenv(AI_TIMEOUT_ENV);
     char *fargv[10];
     int   fargc = 0;
     fargv[fargc++] = "fetch";
@@ -664,7 +723,110 @@ static int run_at_prompt(const char *prompt, FILE *in, FILE *out)
     fargv[fargc++] = (char *)prompt;
     fargv[fargc]   = NULL;
 
-    return cmd_fetch_spec.run(fargc, fargv, in, out);
+    int rc = cmd_fetch_spec.run(fargc, fargv, in, cap);
+    fclose(cap);                 /* flush; buf/size now valid */
+
+    /* Strip the trailing CR/LF/space the line protocol leaves on the reply. */
+    while (size > 0 && (buf[size - 1] == '\n' || buf[size - 1] == '\r' ||
+                        buf[size - 1] == ' '  || buf[size - 1] == '\t'))
+        buf[--size] = '\0';
+
+    *out_reply = buf;
+    return rc;
+}
+
+/*
+ * The '@' interactive hook: a Suggest → Confirm → Execute state machine.
+ *
+ *   1. Suggest  ask the gateway (fetch, in-process) and capture its one line of
+ *               advice rather than printing it.
+ *   2. Confirm  echo it under a "mysh (AI Suggestion)>" banner and require an
+ *               explicit y/Y at a [y/N] gate before anything runs.
+ *   3. Execute  on y, feed the EXACT suggested line through the same engine a
+ *               typed command uses: tok_split() → parse_pipeline() →
+ *               run_pipeline(). Any other key — including a bare Enter — prints
+ *               "Aborted." and returns 1 without running a thing.
+ *
+ * If fetch can't reach the gateway (non-zero exit) or the gateway returns no
+ * usable command, the gate is bypassed and a deterministic offline heuristic
+ * hint is printed instead. Returns the executed pipeline's status, or 1 on
+ * abort / gateway failure.
+ */
+static int run_at_prompt(const char *prompt, FILE *in, FILE *out)
+{
+    /* ── 1. Suggestion phase ─────────────────────────────────────────────── */
+    char *reply = NULL;
+    int   frc   = ai_query(prompt, in, &reply);
+
+    const char *sug = reply ? reply : "";
+    while (*sug == ' ' || *sug == '\t') sug++;   /* skip leading whitespace */
+
+    /* ── 4. Deterministic fallback: unreachable gateway / no command ─────── */
+    int unreachable = (frc != 0);
+    int no_command  = (!unreachable &&
+                       (*sug == '\0' || strncmp(sug, "rahulbox AI", 11) == 0));
+    if (unreachable || no_command) {
+        if (unreachable)
+            fprintf(stderr,
+                    "mysh: @: AI gateway unreachable (fetch exited %d).\n", frc);
+        else
+            fprintf(stderr, "mysh: @: AI gateway returned no command%s%s\n",
+                    (*sug ? ": " : "."), sug);
+        ai_fallback_hint(prompt, out);
+        free(reply);
+        return 1;
+    }
+
+    /* ── 2. Confirmation gate ────────────────────────────────────────────── */
+    fprintf(out, "mysh (AI Suggestion)> %s\n", sug);
+    fflush(out);
+
+    char answer[64];
+    if (linedit_read(in, "Execute this command? [y/N]: ",
+                     answer, sizeof answer) < 0) {
+        fprintf(out, "\nAborted.\n");            /* EOF / Ctrl-D at the gate */
+        free(reply);
+        return 1;
+    }
+
+    const char *a = answer;
+    while (*a == ' ' || *a == '\t') a++;
+    if (*a != 'y' && *a != 'Y') {
+        fprintf(out, "Aborted.\n");
+        free(reply);
+        return 1;
+    }
+
+    /* ── 3. Execution phase: route the exact line through the real engine ── */
+    fprintf(out, "Executing: %s\n", sug);
+    fflush(out);
+
+    tok_t tok;
+    if (tok_split(sug, &tok, 0) < 0) {
+        fprintf(stderr, "mysh: @: could not tokenize suggestion "
+                        "(unmatched quote?)\n");
+        free(reply);
+        return 1;
+    }
+    if (tok.n == 0) {
+        tok_free(&tok);
+        free(reply);
+        return 1;
+    }
+
+    stage_t stages[PIPELINE_MAX];
+    int nstages = 0;
+    if (parse_pipeline(&tok, stages, &nstages) < 0 || nstages == 0) {
+        fprintf(stderr, "mysh: @: malformed pipeline in suggestion\n");
+        tok_free(&tok);
+        free(reply);
+        return 1;
+    }
+
+    int status = run_pipeline(stages, nstages);
+    tok_free(&tok);
+    free(reply);
+    return status;
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
