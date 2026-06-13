@@ -11,6 +11,11 @@ This script is the other end of that socket: it reads one prompt line, asks an
 OpenRouter free-tier model how to accomplish it using only rahulbox's own
 commands, and writes the answer back as a single clean line.
 
+The set of commands the model is allowed to use — and the options each one
+accepts — is loaded at startup from the shell itself via `mysh --commands-json`
+(see shell/mysh.c). The system prompt is generated from that catalog, so the
+model's known vocabulary never drifts from what the binary can actually run.
+
 Wire protocol (must match apps/fetch/cmd_fetch.c exactly):
   * Request  : <prompt text>\\n        (one line, client closes after reading reply)
   * Response : <single clean line>\\n  (NO internal newlines — fetch prints the
@@ -22,7 +27,8 @@ print them concatenated with the answer), so the full round-trip must land
 inside that window. HTTP_TIMEOUT defaults just under 5 s and a timeout returns a
 clean one-line error rather than letting the shell hang.
 
-Dependencies: standard library only (socket, threading, urllib). No `requests`.
+Dependencies: standard library only (socket, threading, urllib, subprocess). No
+`requests`.
 
 Usage:
     export OPENROUTER_API_KEY=sk-or-...
@@ -32,6 +38,7 @@ Usage:
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -41,6 +48,13 @@ import urllib.request
 # ── configuration ────────────────────────────────────────────────────────────
 HOST = os.environ.get("AI_GATEWAY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AI_GATEWAY_PORT", "5001"))
+
+# Path to the compiled rahulbox shell. Its `--commands-json` boot flag prints the
+# command catalog used to build the system prompt below, so the model's known
+# vocabulary always matches what the shell can actually run. Defaults to the
+# sibling shell/mysh next to this script; override if the binary lives elsewhere.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+MYSH_BIN = os.environ.get("AI_GATEWAY_MYSH", os.path.join(_HERE, "shell", "mysh"))
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -62,10 +76,19 @@ READ_TIMEOUT_SECS = 30        # don't let a silent client pin a worker thread
 MAX_REPLY_CHARS = 2000        # the shell shows this inline; keep it sane
 
 # ── system prompt: sandbox the model to the rahulbox command set ─────────────
-ALLOWED_APPS = ("hello", "ls", "stat", "wc", "cat", "echo", "head", "tail",
-                "grep", "sort", "uniq", "cut", "tee", "pkg", "fetch")
+#
+# The behavioural rules below are fixed policy. The command *vocabulary* (rule 1)
+# and the COMMAND REFERENCE section are filled in at startup from the live shell
+# catalog — `mysh --commands-json` — by init_system_prompt(). Adding a command
+# to the shell therefore teaches the gateway about it automatically; there is no
+# hand-maintained command list to keep in sync here.
+#
+# FALLBACK_APPS is used ONLY when the catalog cannot be loaded (e.g. mysh is not
+# built yet) so the gateway still starts, degraded, instead of failing outright.
+FALLBACK_APPS = ("hello", "ls", "stat", "wc", "cat", "echo", "head", "tail",
+                 "grep", "sort", "uniq", "cut", "tee", "pkg", "fetch")
 
-SYSTEM_PROMPT = (
+RULES_TEMPLATE = (
     'You are the dedicated AI assistant embedded inside "rahulbox", a small '
     "custom Unix-style shell written in C. You are NOT a general-purpose "
     "assistant; you exist only to help the user get things done using "
@@ -73,14 +96,14 @@ SYSTEM_PROMPT = (
     "\n"
     "ABSOLUTE RULES — never break these:\n"
     "\n"
-    "1. COMMAND VOCABULARY. You may ONLY use these 15 built-in rahulbox apps, "
-    "and nothing else: " + ", ".join(ALLOWED_APPS) + ". Treat every other "
-    "program name as nonexistent.\n"
+    "1. COMMAND VOCABULARY. You may ONLY use these {count} built-in rahulbox "
+    "apps, and nothing else: {vocab}. Treat every other program name as "
+    "nonexistent.\n"
     "\n"
     "2. FORBIDDEN COMMANDS. rahulbox does NOT ship standard coreutils. NEVER "
     "suggest or even mention cp, mv, rm, find, awk, sed, xargs, chmod, or any "
     "utility that is not in the list above. If a task genuinely cannot be done "
-    "with the 15 allowed apps, say so plainly in one sentence instead of "
+    "with the allowed apps, say so plainly in one sentence instead of "
     "inventing a command.\n"
     "\n"
     '3. SYNTAX. The only supported operator is the pipe "|", connecting '
@@ -97,8 +120,94 @@ SYSTEM_PROMPT = (
     "bullet points, markdown, or code fences. Prefer to answer with just the "
     "recommended pipeline, optionally followed by a short dash-separated "
     "clause explaining it, e.g.: ls | grep \".txt\" | sort — lists text files "
-    "in order. Keep the whole reply to one concise sentence."
+    "in order. Keep the whole reply to one concise sentence.\n"
+    "\n"
+    "COMMAND REFERENCE — the only commands you may use, each with its summary "
+    "and the options it accepts (indented). Honour these exact flag names:\n"
+    "\n"
+    "{reference}"
 )
+
+# Built once at startup by init_system_prompt(); read by query_openrouter().
+SYSTEM_PROMPT = None
+
+
+def load_catalog(mysh_bin):
+    """Return the shell's command catalog (list of dicts) or None on any error.
+
+    Runs `mysh --commands-json` and parses its JSON array. Never raises: a
+    missing binary, non-zero exit, or unparseable output is logged and yields
+    None so the caller can fall back to FALLBACK_APPS.
+    """
+    try:
+        proc = subprocess.run([mysh_bin, "--commands-json"],
+                              capture_output=True, timeout=10)
+    except FileNotFoundError:
+        log("catalog: mysh not found at %s" % mysh_bin)
+        return None
+    except subprocess.TimeoutExpired:
+        log("catalog: `%s --commands-json` timed out" % mysh_bin)
+        return None
+    except OSError as e:
+        log("catalog: cannot run %s — %s" % (mysh_bin, e))
+        return None
+
+    if proc.returncode != 0:
+        log("catalog: %s exited with status %d" % (mysh_bin, proc.returncode))
+        return None
+    try:
+        data = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        log("catalog: unparseable JSON from mysh — %s" % e)
+        return None
+    if not isinstance(data, list) or not data:
+        log("catalog: mysh returned an empty or non-array catalog")
+        return None
+    return data
+
+
+def _render_reference(catalog):
+    """Render the catalog as compact per-command help for the system prompt.
+
+    One block per command: a "name — summary" header followed by its usage lines
+    indented four spaces. The bare "Options:" header line is dropped as noise.
+    """
+    blocks = []
+    for cmd in catalog:
+        name = cmd.get("name")
+        if not name:
+            continue
+        summary = cmd.get("summary", "")
+        head = "%s — %s" % (name, summary) if summary else name
+        usage = [u for u in cmd.get("usage", [])
+                 if u.strip() and u.strip() != "Options:"]
+        blocks.append(head + "".join("\n    " + u for u in usage))
+    return "\n".join(blocks)
+
+
+def build_system_prompt(catalog):
+    """Fill RULES_TEMPLATE from the catalog, or FALLBACK_APPS if it is None."""
+    if catalog:
+        names = [c["name"] for c in catalog if c.get("name")]
+        reference = _render_reference(catalog)
+    else:
+        names = list(FALLBACK_APPS)
+        reference = "\n".join("- %s" % n for n in names)
+    return RULES_TEMPLATE.format(count=len(names),
+                                 vocab=", ".join(names),
+                                 reference=reference)
+
+
+def init_system_prompt():
+    """Load the shell catalog and build SYSTEM_PROMPT once, at startup."""
+    global SYSTEM_PROMPT
+    catalog = load_catalog(MYSH_BIN)
+    SYSTEM_PROMPT = build_system_prompt(catalog)
+    if catalog:
+        log("catalog: loaded %d commands from %s" % (len(catalog), MYSH_BIN))
+    else:
+        log("catalog: load failed; using built-in fallback vocabulary (%d apps)"
+            % len(FALLBACK_APPS))
 
 
 # ── logging ──────────────────────────────────────────────────────────────────
@@ -263,6 +372,8 @@ def handle_conn(conn, addr):
 
 # ── server ───────────────────────────────────────────────────────────────────
 def serve():
+    init_system_prompt()
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:

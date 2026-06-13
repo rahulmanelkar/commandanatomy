@@ -97,6 +97,117 @@ static void reg_print_all(void)
         printf("  %-16s %s\n", registry[i]->name, registry[i]->summary);
 }
 
+/* ── --commands-json: export the registry as an MCP-style tool catalog ───────
+ *
+ * Emit a single top-level JSON array describing every registered command so an
+ * AI agent can discover the shell's capabilities without running anything. Each
+ * element is { "name", "summary", "usage": [ ...lines... ] }, where the usage
+ * lines are captured from the command's own print_usage() — the same argtable3
+ * help text a human sees — so the catalog and --help can never drift apart.
+ */
+
+/* Write s[0..len) to `out` as a JSON string literal (quotes included), escaping
+ * the characters JSON requires plus every C0 control char as \u00XX. Raw UTF-8
+ * bytes (>= 0x80) pass through verbatim, which is valid JSON. */
+static void json_write_string(FILE *out, const char *s, size_t len)
+{
+    fputc('"', out);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+            case '"':  fputs("\\\"", out); break;
+            case '\\': fputs("\\\\", out); break;
+            case '\b': fputs("\\b",  out); break;
+            case '\f': fputs("\\f",  out); break;
+            case '\n': fputs("\\n",  out); break;
+            case '\r': fputs("\\r",  out); break;
+            case '\t': fputs("\\t",  out); break;
+            default:
+                if (c < 0x20) fprintf(out, "\\u%04x", c);
+                else          fputc((int)c, out);
+        }
+    }
+    fputc('"', out);
+}
+
+/* Run spec->print_usage() into an in-memory buffer and return it (caller frees);
+ * *out_len receives the byte count. Returns NULL on allocation failure or if the
+ * command has no print_usage. */
+static char *capture_usage(const cmd_spec_t *spec, size_t *out_len)
+{
+    *out_len = 0;
+    if (!spec->print_usage) return NULL;
+
+    char  *buf  = NULL;
+    size_t size = 0;
+    FILE  *mem  = open_memstream(&buf, &size);   /* glibc, needs _GNU_SOURCE */
+    if (!mem) return NULL;
+
+    spec->print_usage(mem);
+    fclose(mem);                                  /* flushes; buf/size now set */
+    *out_len = size;
+    return buf;
+}
+
+/* Emit the captured usage text as a JSON array of trimmed, non-blank lines onto
+ * `out`. Leading indentation is stripped and whitespace-only lines dropped so
+ * the array is a clean, flat list of usage/option lines. */
+static void json_write_usage_array(FILE *out, const char *text, size_t len)
+{
+    fputs("[", out);
+    int first = 1;
+    size_t start = 0;
+    for (size_t j = 0; j <= len; j++) {
+        if (j != len && text[j] != '\n') continue;
+
+        /* line is text[start..j); drop a trailing CR if present */
+        size_t s = start, e = j;
+        if (e > s && text[e - 1] == '\r') e--;
+        /* trim leading whitespace */
+        while (s < e && (text[s] == ' ' || text[s] == '\t')) s++;
+
+        /* skip blank lines */
+        int blank = 1;
+        for (size_t k = s; k < e; k++)
+            if (!isspace((unsigned char)text[k])) { blank = 0; break; }
+
+        if (!blank) {
+            fputs(first ? "\n        " : ",\n        ", out);
+            json_write_string(out, text + s, e - s);
+            first = 0;
+        }
+        start = j + 1;
+    }
+    fputs(first ? "]" : "\n      ]", out);   /* "[]" when no usage lines */
+}
+
+/* Print the whole registry as one valid JSON array on stdout. */
+static void dump_commands_json(void)
+{
+    printf("[");
+    for (int i = 0; i < registry_n; i++) {
+        const cmd_spec_t *spec = registry[i];
+        const char *name    = spec->name    ? spec->name    : "";
+        const char *summary = spec->summary ? spec->summary : "";
+
+        printf("%s\n  {\n", i ? "," : "");
+
+        printf("    \"name\": ");
+        json_write_string(stdout, name, strlen(name));
+        printf(",\n    \"summary\": ");
+        json_write_string(stdout, summary, strlen(summary));
+
+        size_t ulen = 0;
+        char  *usage = capture_usage(spec, &ulen);
+        printf(",\n    \"usage\": ");
+        json_write_usage_array(stdout, usage ? usage : "", ulen);
+        free(usage);
+
+        printf("\n  }");
+    }
+    printf("%s]\n", registry_n ? "\n" : "");
+}
+
 /* ── pipeline structures ────────────────────────────────────────────────── */
 
 #define PIPELINE_MAX 16
@@ -578,6 +689,15 @@ int main(int argc, char **argv)
     reg_register(&cmd_fetch_spec);
     reg_register(&cmd_mkdir_spec);
     reg_register(&cmd_ftpd_spec);
+
+    /* ── --commands-json: boot-time tool-catalog export ─────────────────────
+     * Must run after the registry is fully populated but before any
+     * interactive/script setup. Dump the registry as JSON and exit 0 so an AI
+     * agent can ingest the catalog with a plain `mysh --commands-json`. */
+    if (argc >= 2 && strcmp(argv[1], "--commands-json") == 0) {
+        dump_commands_json();
+        return 0;
+    }
 
     setup_path();
 
