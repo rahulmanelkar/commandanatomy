@@ -47,6 +47,20 @@ static void build_grep_argtable(
     tbl[10] = NULL;
 }
 
+/* MCP introspection hook (see cmd_spec_t.build_argtable). Caller frees with
+ * arg_freetable(tbl, 10). PATTERN is arg_str1 (mincount 1) -> "required". */
+static int grep_build_argtable(void **tbl, int maxn)
+{
+    if (maxn < 11) return -1;
+    struct arg_lit  *help, *ic, *ln, *count, *invert, *fwm, *json;
+    struct arg_str  *pattern;
+    struct arg_file *files;
+    struct arg_end  *end;
+    build_grep_argtable(&help, &ic, &ln, &count, &invert, &fwm, &json,
+                        &pattern, &files, &end, tbl);
+    return 10;  /* tbl[0..9] populated; tbl[10] = NULL */
+}
+
 /* --------------------------------------------------------------------------
  * helpers
  * -------------------------------------------------------------------------- */
@@ -297,4 +311,5 @@ cmd_spec_t cmd_grep_spec = {
                   "Use --json to emit structured JSON output.",
     .run         = grep_run,
     .print_usage = grep_print_usage,
+    .build_argtable = grep_build_argtable,
 };

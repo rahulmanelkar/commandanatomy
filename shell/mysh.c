@@ -31,6 +31,9 @@
 #include <pthread.h>
 
 #include "../include/cmd_spec.h"
+#include "argtable3.h"      /* arg_hdr introspection for MCP inputSchema */
+#define JSMN_HEADER         /* declarations only; implementation links from jsmn.o */
+#include "jsmn.h"
 #include "tok.h"
 #include "linedit.h"
 
@@ -206,6 +209,167 @@ static void dump_commands_json(void)
         printf("\n  }");
     }
     printf("%s]\n", registry_n ? "\n" : "");
+}
+
+/* ── --mcp-tools: emit a spec-compliant MCP tools/list result ────────────────
+ *
+ * Where --commands-json emits human help text, this derives a typed JSON-Schema
+ * `inputSchema` per command by introspecting its argtable3 objects via the
+ * cmd_spec_t.build_argtable hook. Type mapping:
+ *     arg_lit (no value)         -> "boolean"
+ *     arg_int                    -> "integer"
+ *     arg_dbl                    -> "number"
+ *     arg_str / arg_file / other -> "string"
+ *     any arg with mincount > 0  -> added to "required"
+ * Every allocation is stack-local and freed before return, so this is safe to
+ * run on a worker thread (no static/global state). */
+
+#define MCP_ARGTABLE_MAX 32
+
+/* JSON property name for one arg: first long option, else the short-option
+ * char, else (a positional) a lowercased alphanumeric squeeze of its datatype,
+ * e.g. "[FILE...]" -> "file", "PATTERN" -> "pattern". */
+static void mcp_prop_name(const struct arg_hdr *h, char *buf, size_t cap)
+{
+    size_t i = 0;
+    if (h->longopts && *h->longopts) {
+        for (const char *p = h->longopts; *p && *p != ',' && i + 1 < cap; p++)
+            buf[i++] = *p;
+    } else if (h->shortopts && *h->shortopts) {
+        buf[i++] = h->shortopts[0];
+    } else {
+        const char *dt = h->datatype ? h->datatype : "";
+        for (const char *p = dt; *p && i + 1 < cap; p++)
+            if (isalnum((unsigned char)*p))
+                buf[i++] = (char)tolower((unsigned char)*p);
+    }
+    if (i == 0 && cap > 3) { buf[i++] = 'a'; buf[i++] = 'r'; buf[i++] = 'g'; }
+    buf[i] = '\0';
+}
+
+/* Skip the arg_end terminator and the universal --help flag (not a tool arg). */
+static int mcp_is_property(const struct arg_hdr *h)
+{
+    if (!h || (h->flag & ARG_TERMINATOR)) return 0;
+    if (h->longopts && strcmp(h->longopts, "help") == 0) return 0;
+    return 1;
+}
+
+static void write_mcp_input_schema(FILE *out, const cmd_spec_t *spec)
+{
+    /* No introspection hook: still emit a valid (open) object schema. */
+    if (!spec->build_argtable) {
+        fputs("{ \"type\": \"object\", \"properties\": {} }", out);
+        return;
+    }
+
+    void *tbl[MCP_ARGTABLE_MAX];
+    int n = spec->build_argtable(tbl, MCP_ARGTABLE_MAX);
+    if (n < 0) {
+        fputs("{ \"type\": \"object\", \"properties\": {} }", out);
+        return;
+    }
+
+    /* argtable3 assigns one fixed scanfn per value type, so pointer-equality
+     * classifies an arg even when the builder overrode its datatype string. */
+    struct arg_int *ref_int = arg_int0(NULL, "i", NULL, NULL);
+    struct arg_dbl *ref_dbl = arg_dbl0(NULL, "d", NULL, NULL);
+    arg_scanfn *int_scan = ref_int ? ref_int->hdr.scanfn : NULL;
+    arg_scanfn *dbl_scan = ref_dbl ? ref_dbl->hdr.scanfn : NULL;
+
+    fputs("{\n        \"type\": \"object\",\n        \"properties\": {", out);
+
+    int props = 0;
+    for (int i = 0; i < n; i++) {
+        struct arg_hdr *h = (struct arg_hdr *)tbl[i];   /* hdr is the first member */
+        if (!mcp_is_property(h)) continue;
+
+        const char *type;
+        if (!(h->flag & ARG_HASVALUE))               type = "boolean"; /* arg_lit */
+        else if (int_scan && h->scanfn == int_scan)  type = "integer";
+        else if (dbl_scan && h->scanfn == dbl_scan)  type = "number";
+        else                                         type = "string";  /* str/file */
+
+        char name[64];
+        mcp_prop_name(h, name, sizeof name);
+
+        fputs(props++ ? ",\n          " : "\n          ", out);
+        json_write_string(out, name, strlen(name));
+        fputs(": { \"type\": ", out);
+        json_write_string(out, type, strlen(type));
+        if (h->glossary && *h->glossary) {
+            fputs(", \"description\": ", out);
+            json_write_string(out, h->glossary, strlen(h->glossary));
+        }
+        fputs(" }", out);
+    }
+    fputs(props ? "\n        }" : "}", out);
+
+    /* required[]: any arg with mincount > 0 (covers required positionals). */
+    int reqs = 0;
+    for (int i = 0; i < n; i++) {
+        struct arg_hdr *h = (struct arg_hdr *)tbl[i];
+        if (!mcp_is_property(h) || h->mincount <= 0) continue;
+        char name[64];
+        mcp_prop_name(h, name, sizeof name);
+        fputs(reqs++ ? ", " : ",\n        \"required\": [", out);
+        json_write_string(out, name, strlen(name));
+    }
+    if (reqs) fputc(']', out);
+
+    fputs("\n      }", out);
+
+    arg_freetable(tbl, (size_t)n);             /* free the command's table */
+    void *reftab[2]; int rn = 0;               /* and the reference objects */
+    if (ref_int) reftab[rn++] = ref_int;
+    if (ref_dbl) reftab[rn++] = ref_dbl;
+    arg_freetable(reftab, (size_t)rn);
+}
+
+/* Emit the MCP ListToolsResult: { "tools": [ {name, description, inputSchema} ] }.
+ * The JSON-RPC 2.0 envelope (jsonrpc/id/result) is added by the Phase 2 server
+ * dispatch; this is the `result` payload a `tools/list` call returns. */
+static void dump_mcp_tools(void)
+{
+    printf("{\n  \"tools\": [");
+    for (int i = 0; i < registry_n; i++) {
+        const cmd_spec_t *spec = registry[i];
+        const char *name = spec->name ? spec->name : "";
+        const char *desc = spec->summary ? spec->summary : "";
+
+        printf("%s\n    {\n      \"name\": ", i ? "," : "");
+        json_write_string(stdout, name, strlen(name));
+        printf(",\n      \"description\": ");
+        json_write_string(stdout, desc, strlen(desc));
+        printf(",\n      \"inputSchema\": ");
+        write_mcp_input_schema(stdout, spec);
+        printf("\n    }");
+    }
+    printf("%s]\n}\n", registry_n ? "\n  " : "");
+}
+
+/* --jsmn-selftest: prove the vendored parser links and runs (Phase 2 will use
+ * it to parse inbound JSON-RPC). Zero-allocation: tokens live on the stack. */
+static int mcp_jsmn_selftest(void)
+{
+    static const char *sample =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}";
+    jsmn_parser p;
+    jsmntok_t   tok[32];
+    jsmn_init(&p);
+    int n = jsmn_parse(&p, sample, strlen(sample), tok, 32);
+    if (n < 0) { fprintf(stderr, "jsmn: parse error %d\n", n); return 1; }
+    printf("jsmn: parsed %d tokens from a sample JSON-RPC request\n", n);
+    for (int i = 0; i + 1 < n; i++) {
+        int len = tok[i].end - tok[i].start;
+        if (tok[i].type == JSMN_STRING && len == 6 &&
+            strncmp(sample + tok[i].start, "method", 6) == 0) {
+            printf("jsmn: method = %.*s\n",
+                   tok[i + 1].end - tok[i + 1].start, sample + tok[i + 1].start);
+            break;
+        }
+    }
+    return 0;
 }
 
 /* ── pipeline structures ────────────────────────────────────────────────── */
@@ -859,6 +1023,13 @@ int main(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "--commands-json") == 0) {
         dump_commands_json();
         return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--mcp-tools") == 0) {
+        dump_mcp_tools();
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--jsmn-selftest") == 0) {
+        return mcp_jsmn_selftest();
     }
 
     setup_path();

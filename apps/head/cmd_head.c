@@ -34,6 +34,19 @@ static void build_head_argtable(
     tbl[6] = NULL;
 }
 
+/* MCP introspection hook (see cmd_spec_t.build_argtable). Caller frees with
+ * arg_freetable(tbl, 6). Demonstrates arg_int -> JSON "integer" via -n/-c. */
+static int head_build_argtable(void **tbl, int maxn)
+{
+    if (maxn < 7) return -1;
+    struct arg_lit  *help, *json;
+    struct arg_int  *lines, *bytes;
+    struct arg_file *files;
+    struct arg_end  *end;
+    build_head_argtable(&help, &lines, &bytes, &json, &files, &end, tbl);
+    return 6;   /* tbl[0..5] populated; tbl[6] = NULL */
+}
+
 /* --------------------------------------------------------------------------
  * helpers
  * -------------------------------------------------------------------------- */
@@ -237,4 +250,5 @@ cmd_spec_t cmd_head_spec = {
                   "Use --json to emit structured JSON output.",
     .run         = head_run,
     .print_usage = head_print_usage,
+    .build_argtable = head_build_argtable,
 };
