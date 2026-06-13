@@ -32,6 +32,7 @@ rahulbox/
 │   ├── mysh.c              # shell main loop + execution engine
 │   ├── tok.c / tok.h       # quote-aware tokenizer
 │   └── Makefile
+├── ai_gateway.py           # OpenRouter bridge for the shell's '@' prompts
 ├── Makefile                # top-level build coordinator
 └── CommandAnatomy.ipynb    # course notebook and architecture guide
 ```
@@ -689,8 +690,9 @@ Opens a TCP connection to `HOST:PORT`, sends `MESSAGE` followed by a newline, th
 | `-H`, `--host=HOST` | Host to connect to (name or IP; required) |
 | `-p`, `--port=PORT` | TCP port, 1–65535 (required) |
 | `--json` | Machine-readable JSON output |
+| `-t`, `--timeout=SECS` | Seconds to wait for the reply (default 5, `0` = no limit; env `FETCH_TIMEOUT`) |
 
-**Robustness:** inputs are validated before any network call (non-empty host ≤ 255 chars with no control characters; port in range). Both the connect and the receive are bounded to 5 seconds — a non-blocking `connect` waited on with `poll`, plus a `SO_RCVTIMEO` on the socket — so neither an unreachable host nor a silent peer can hang the command. Every socket error — DNS resolution, `connect`, connect/receive timeout, `send`, or `recv` — is reported and exits non-zero.
+**Robustness:** inputs are validated before any network call (non-empty host ≤ 255 chars with no control characters; port in range; timeout 0–3600). The connect is bounded to 5 seconds (a non-blocking `connect` waited on with `poll`), and the receive is bounded by a `SO_RCVTIMEO` on the socket — 5 seconds by default, or whatever `-t`/`--timeout` (or the `FETCH_TIMEOUT` env var) sets, with `0` meaning wait indefinitely — so neither an unreachable host nor a silent peer can hang the command. Every socket error — DNS resolution, `connect`, connect/receive timeout, `send`, or `recv` — is reported and exits non-zero.
 
 Exit status: 0 on success, 1 on any validation or network error.
 
@@ -718,6 +720,9 @@ apps/fetch/fetch --json -H 127.0.0.1 -p 8080 ping
 
 # Inside the shell, compose with other built-ins
 fetch --json -H 127.0.0.1 -p 8080 ping | grep '"ok": true'
+
+# Wait longer for a slow server (here, up to 30s; FETCH_TIMEOUT=30 also works)
+apps/fetch/fetch -t 30 -H 127.0.0.1 -p 5001 "summarize this"
 
 # Errors go to stderr and exit non-zero
 apps/fetch/fetch -H 127.0.0.1 -p 9 hi
@@ -769,7 +774,7 @@ The prompt shows the last exit code when non-zero: `mysh [1]> `.
 | Background execution | `sleep 10 &` — runs in background, prints `[bg] PID`, shell continues |
 | Comments | `# this line is ignored` |
 | Script files | `mysh deploy.sh` |
-| Natural-language `@` prefix | `@ what lists files` — forwards the prompt to a local AI mock server (interactive only) |
+| Natural-language `@` prefix | `@ list files by size` — forwards the prompt to a local AI gateway over TCP (interactive only; see [setup](#ai-gateway-setup-ai_gatewaypy)) |
 | Interactive line editing | Left/Right arrows, Ctrl-Left/Right, Home/End, Delete, Ctrl-A/E/U/K/W — edit anywhere in the line ([details](#line-editing)) |
 
 ### Line editing
@@ -955,11 +960,11 @@ echo 'ls apps | wc -l' | shell/mysh
 
 #### Natural-language `@` prefix
 
-When an **interactive** line's first non-whitespace character is `@`, the shell bypasses tokenization and pipeline parsing entirely. The rest of the line is taken as a raw prompt and forwarded — using the `fetch` command's logic in-process — to a local AI mock server at `localhost:5001`, and the server's reply is printed back to you.
+When an **interactive** line's first non-whitespace character is `@`, the shell bypasses tokenization and pipeline parsing entirely. The rest of the line is taken as a raw prompt and forwarded — using the `fetch` command's logic in-process — over TCP to a line server at `localhost:5001`, and the server's reply is printed back to you.
 
 ```sh
-mysh> @ what command lists files in detail
-AI: try 'ls -la'
+mysh> @ list files in detail
+ls -la — lists every entry with permissions, owner, and size
 ```
 
 - One optional pair of surrounding quotes is stripped: `@ "list files"` sends `list files`.
@@ -967,7 +972,41 @@ AI: try 'ls -la'
 - If the server is unreachable, `fetch`'s `Connection refused` is printed to stderr and the shell continues normally.
 - `@` is an **interactive-only** convenience: in a script or piped input it is skipped with a notice on stderr (so non-interactive runs stay offline and deterministic), and the rest of the script runs.
 
-The endpoint is `AI_HOST`/`AI_PORT` in `shell/mysh.c`. Any line server that reads a newline-terminated request and replies with a line works as the backend — see the `fetch` command for the protocol.
+The endpoint is `AI_HOST`/`AI_PORT` in `shell/mysh.c`. Any line server that reads a newline-terminated request and replies with one line works as the backend — see the `fetch` command for the protocol.
+
+##### AI gateway setup (`ai_gateway.py`)
+
+The repo ships `ai_gateway.py`, a dependency-free Python bridge that serves that endpoint and forwards `@` prompts to a free-tier model on [OpenRouter](https://openrouter.ai). It uses only the standard library (`socket` + `urllib` — no `pip install`) and sandboxes the model with a system prompt that restricts every suggestion to rahulbox's 15 built-in apps and `|` pipelines (never `cp`/`mv`/`rm`/`find`/`awk`/`sed`, nor `&&`/`||`/`;`). Each reply is collapsed to a single newline-terminated line to match `fetch`'s line protocol, and every error path returns one clean line so the shell never hangs.
+
+```sh
+# 1. Get a free API key from https://openrouter.ai/keys
+export OPENROUTER_API_KEY=sk-or-...
+
+# 2. Start the gateway (listens on 127.0.0.1:5001)
+python3 ai_gateway.py
+
+# 3. In another terminal, launch the shell and ask in plain English
+./shell/mysh
+mysh> @ count the lines in every .c file under apps
+```
+
+Configuration (all optional except the key) via environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENROUTER_API_KEY` | _(required)_ | OpenRouter API key; without it every prompt returns a one-line config error |
+| `AI_GATEWAY_MODEL` | `google/gemini-2.5-flash:free` | Model id (e.g. `meta-llama/llama-3-8b-instruct:free`) |
+| `AI_GATEWAY_TIMEOUT` | `4.5` | Seconds to wait for OpenRouter before returning a one-line error |
+| `AI_GATEWAY_HOST` / `AI_GATEWAY_PORT` | `127.0.0.1` / `5001` | Bind address (must match `AI_HOST`/`AI_PORT` in the shell) |
+
+**Timeouts — keep the two in sync.** The shell's `fetch` aborts a reply that takes longer than **5 seconds** by default, which is tight for a live LLM round-trip. Raise it for the `@` path with `RAHULBOX_AI_TIMEOUT` (the shell forwards it to `fetch` as `-t SECS`; `0` = wait indefinitely), and set the gateway's own `AI_GATEWAY_TIMEOUT` just *under* the shell's so a slow model yields a clean one-line error instead of being cut off mid-reply:
+
+```sh
+RAHULBOX_AI_TIMEOUT=20 ./shell/mysh            # shell waits up to 20s for @ replies
+AI_GATEWAY_TIMEOUT=18 python3 ai_gateway.py    # gateway gives up at 18s
+```
+
+`RAHULBOX_AI_TIMEOUT` only affects the `@` path; plain `fetch` calls still use their own 5s default (or `-t`/`FETCH_TIMEOUT`).
 
 ---
 
