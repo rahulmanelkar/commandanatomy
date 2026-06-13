@@ -12,7 +12,9 @@
 
 /* Bounds for input validation and network timeouts. */
 #define FETCH_CONNECT_TIMEOUT_SECS 5
-#define FETCH_RECV_TIMEOUT_SECS    5
+#define FETCH_RECV_TIMEOUT_DEFAULT 5     /* reply wait; override with --timeout / FETCH_TIMEOUT */
+#define FETCH_RECV_TIMEOUT_MAX     3600  /* 1 hour upper bound on the configurable timeout */
+#define FETCH_TIMEOUT_ENV          "FETCH_TIMEOUT"
 #define FETCH_MAX_HOST_LEN         255   /* RFC 1035 hostname limit */
 #define FETCH_PORT_MIN             1
 #define FETCH_PORT_MAX             65535
@@ -33,14 +35,17 @@ static void build_fetch_argtable(
     struct arg_str  **host,
     struct arg_int  **port,
     struct arg_lit  **json,
+    struct arg_int  **timeout,
     struct arg_str  **message,
     struct arg_end  **end,
-    void            **tbl)         /* caller-allocated array of 7 slots */
+    void            **tbl)         /* caller-allocated array of 8 slots */
 {
     *help    = arg_lit0("h", "help",        "show this help and exit");
     *host    = arg_str1("H", "host", "HOST", "host to connect to");
     *port    = arg_int1("p", "port", "PORT", "TCP port to connect to");
     *json    = arg_lit0(NULL, "json",       "emit machine-readable JSON (for agents/MCP)");
+    *timeout = arg_int0("t", "timeout", "SECS",
+                        "seconds to wait for the reply (default 5, 0 = no limit; env FETCH_TIMEOUT)");
     *message = arg_str1(NULL, NULL, "MESSAGE", "message to send to the host");
     *end     = arg_end(20);
 
@@ -48,9 +53,10 @@ static void build_fetch_argtable(
     tbl[1] = *host;
     tbl[2] = *port;
     tbl[3] = *json;
-    tbl[4] = *message;
-    tbl[5] = *end;
-    tbl[6] = NULL;
+    tbl[4] = *timeout;
+    tbl[5] = *message;
+    tbl[6] = *end;
+    tbl[7] = NULL;
 }
 
 /* --------------------------------------------------------------------------
@@ -170,11 +176,12 @@ void fetch_print_usage(FILE *out)
     struct arg_str  *host;
     struct arg_int  *port;
     struct arg_lit  *json;
+    struct arg_int  *timeout;
     struct arg_str  *message;
     struct arg_end  *end;
-    void            *tbl[7];
+    void            *tbl[8];
 
-    build_fetch_argtable(&help, &host, &port, &json, &message, &end, tbl);
+    build_fetch_argtable(&help, &host, &port, &json, &timeout, &message, &end, tbl);
 
     fprintf(out, "Usage: fetch ");
     arg_print_syntax(out, tbl, "\n");
@@ -182,7 +189,7 @@ void fetch_print_usage(FILE *out)
                  "MESSAGE,\nand print the server's reply line.\n\nOptions:\n");
     arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(tbl, 6);
+    arg_freetable(tbl, 7);
 }
 
 /* --------------------------------------------------------------------------
@@ -205,24 +212,25 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     struct arg_str  *host;
     struct arg_int  *port;
     struct arg_lit  *json;
+    struct arg_int  *timeout;
     struct arg_str  *message;
     struct arg_end  *end;
-    void            *tbl[7];
+    void            *tbl[8];
 
-    build_fetch_argtable(&help, &host, &port, &json, &message, &end, tbl);
+    build_fetch_argtable(&help, &host, &port, &json, &timeout, &message, &end, tbl);
 
     int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
         fetch_print_usage(out_stream);
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 0;
     }
 
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "fetch");
         fprintf(stderr, "Try 'fetch --help' for more information.\n");
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
@@ -249,27 +257,54 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     size_t hostlen = strlen(the_host);
     if (hostlen == 0) {
         FETCH_FAIL("host", "host must not be empty");
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
     }
     if (hostlen > FETCH_MAX_HOST_LEN) {
         FETCH_FAIL("host", "host name too long");
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
     }
     for (size_t i = 0; i < hostlen; i++) {
         unsigned char ch = (unsigned char)the_host[i];
         if (ch < 0x20 || ch == 0x7f) {       /* reject control characters */
             FETCH_FAIL("host", "host contains invalid characters");
-            arg_freetable(tbl, 6);
+            arg_freetable(tbl, 7);
             return 1;
         }
     }
 
     if (the_port < FETCH_PORT_MIN || the_port > FETCH_PORT_MAX) {
         FETCH_FAIL("port", "port out of range (must be 1-65535)");
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
+    }
+
+    /* --- resolve the recv timeout ----------------------------------------
+     * Precedence: --timeout flag > FETCH_TIMEOUT env > built-in default.
+     * 0 means "wait indefinitely" (SO_RCVTIMEO of {0,0} disables the limit). */
+    int recv_timeout = FETCH_RECV_TIMEOUT_DEFAULT;
+    const char *env_to = getenv(FETCH_TIMEOUT_ENV);
+    if (env_to && *env_to) {
+        char *endp;
+        errno = 0;
+        long v = strtol(env_to, &endp, 10);
+        if (errno != 0 || *endp != '\0' || v < 0 || v > FETCH_RECV_TIMEOUT_MAX) {
+            FETCH_FAIL("timeout",
+                       "FETCH_TIMEOUT must be an integer 0-3600 (seconds)");
+            arg_freetable(tbl, 7);
+            return 1;
+        }
+        recv_timeout = (int)v;
+    }
+    if (timeout->count > 0) {
+        int v = timeout->ival[0];
+        if (v < 0 || v > FETCH_RECV_TIMEOUT_MAX) {
+            FETCH_FAIL("timeout", "timeout out of range (must be 0-3600 seconds)");
+            arg_freetable(tbl, 7);
+            return 1;
+        }
+        recv_timeout = v;
     }
 
     /* --- resolve ---------------------------------------------------------- */
@@ -277,7 +312,7 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     const char      *errmsg = NULL;
     if (resolve_host(the_host, the_port, &res, &errmsg) != 0) {
         FETCH_FAIL("resolve", errmsg);
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
@@ -297,20 +332,22 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 
     if (fd < 0) {
         FETCH_FAIL("connect", strerror(errno));
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
     /* --- setsockopt(SO_RCVTIMEO) -----------------------------------------
      * Bound recv() so a silent or slow peer cannot hang the command: after
-     * FETCH_RECV_TIMEOUT_SECS with no data, recv() fails with EAGAIN. */
+     * recv_timeout seconds with no data, recv() fails with EAGAIN.  A value of
+     * 0 leaves tv zeroed, which disables the timeout (recv blocks until data
+     * or peer close). */
     struct timeval tv;
-    tv.tv_sec  = FETCH_RECV_TIMEOUT_SECS;
+    tv.tv_sec  = recv_timeout;
     tv.tv_usec = 0;
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
         FETCH_FAIL("setsockopt", strerror(errno));
         close(fd);
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
@@ -323,7 +360,7 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     if (!frame) {
         FETCH_FAIL("send", "out of memory");
         close(fd);
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
     }
     memcpy(frame, the_msg, msglen);
@@ -333,7 +370,7 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
         FETCH_FAIL("send", strerror(errno));
         free(frame);
         close(fd);
-        arg_freetable(tbl, 6);
+        arg_freetable(tbl, 7);
         return 1;
     }
     free(frame);
@@ -359,7 +396,7 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
             }
             free(reply);
             close(fd);
-            arg_freetable(tbl, 6);
+            arg_freetable(tbl, 7);
             return 1;
         }
         if (n == 0)
@@ -373,7 +410,7 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
                 FETCH_FAIL("recv", "out of memory");
                 free(reply);
                 close(fd);
-                arg_freetable(tbl, 6);
+                arg_freetable(tbl, 7);
                 return 1;
             }
             reply = grown;
@@ -401,7 +438,7 @@ int fetch_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     }
 
     free(reply);
-    arg_freetable(tbl, 6);
+    arg_freetable(tbl, 7);
     return 0;
 
     #undef FETCH_FAIL
@@ -417,8 +454,10 @@ cmd_spec_t cmd_fetch_spec = {
     .long_help  = "Open a TCP connection to HOST:PORT, send MESSAGE followed "
                   "by a newline, then read and print the server's reply line. "
                   "Uses a line-based protocol (each exchange is newline "
-                  "terminated). Pass --json for machine-readable output "
-                  "suitable for agent/MCP integration.",
+                  "terminated). The reply wait defaults to 5 seconds; override "
+                  "it with --timeout SECS or the FETCH_TIMEOUT environment "
+                  "variable (0 = wait indefinitely). Pass --json for "
+                  "machine-readable output suitable for agent/MCP integration.",
     .run         = fetch_run,
     .print_usage = fetch_print_usage,
 };

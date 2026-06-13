@@ -60,6 +60,10 @@ extern cmd_spec_t cmd_ftpd_spec;
  * server. */
 #define AI_HOST "localhost"
 #define AI_PORT "5001"
+/* When set and non-empty, its value is passed to fetch as `-t SECS` so the AI
+ * round-trip can wait longer than fetch's 5s default without affecting plain
+ * `fetch` calls. fetch validates the value (integer 0-3600; 0 = no limit). */
+#define AI_TIMEOUT_ENV "RAHULBOX_AI_TIMEOUT"
 
 /*
  * When the shell reads commands from a piped/redirected stdin (not a tty and
@@ -524,15 +528,31 @@ static void setup_path(void)
  * parse.  The prompt becomes fetch's MESSAGE positional; the "--" guards
  * prompts that happen to start with '-'.  fetch writes the server's reply to
  * out_stream itself, so the suggestion lands cleanly on the user's stream.
- * Returns fetch's exit code.
+ *
+ * If $RAHULBOX_AI_TIMEOUT is set, its value is forwarded as fetch's `-t SECS`
+ * so a slow LLM gateway gets more than the 5s default; fetch validates it and
+ * reports any out-of-range value. Returns fetch's exit code.
  */
 static int run_at_prompt(const char *prompt, FILE *in, FILE *out)
 {
-    char *fargv[] = {
-        "fetch", "-H", AI_HOST, "-p", AI_PORT, "--",
-        (char *)prompt, NULL
-    };
-    int fargc = (int)(sizeof fargv / sizeof fargv[0]) - 1;
+    const char *timeout = getenv(AI_TIMEOUT_ENV);
+
+    /* fetch -H HOST -p PORT [-t SECS] -- PROMPT : at most 9 args + NULL. */
+    char *fargv[10];
+    int   fargc = 0;
+    fargv[fargc++] = "fetch";
+    fargv[fargc++] = "-H";
+    fargv[fargc++] = AI_HOST;
+    fargv[fargc++] = "-p";
+    fargv[fargc++] = AI_PORT;
+    if (timeout && *timeout) {
+        fargv[fargc++] = "-t";
+        fargv[fargc++] = (char *)timeout;
+    }
+    fargv[fargc++] = "--";
+    fargv[fargc++] = (char *)prompt;
+    fargv[fargc]   = NULL;
+
     return cmd_fetch_spec.run(fargc, fargv, in, out);
 }
 
