@@ -192,3 +192,9 @@ All commands with `--json` are designed to be called by an LLM agent or MCP serv
 4. Field names are stable snake_case strings.
 
 The shell may expose these commands as MCP tools by wrapping each `cmd_spec_t` — using `summary` as the tool description and capturing `--json` stdout as the tool result.
+
+### Tool catalog (`mysh --commands-json`)
+
+`mysh --commands-json` is a boot-time global flag that prints the command registry as a single JSON array — one `{ "name", "summary", "usage": [...] }` object per command — and exits `0` without starting the interactive shell. The `usage` array is each command's `print_usage()` output (the `argtable3` help) captured and JSON-escaped so it parses with `json.loads()`.
+
+This is the catalog an MCP tool provider or LLM agent reads to discover the command set and each command's flags. The bundled `ai_gateway.py` consumes it at startup to build its system-prompt vocabulary, so adding a command to the shell automatically propagates to the catalog and the AI's allowed toolset.

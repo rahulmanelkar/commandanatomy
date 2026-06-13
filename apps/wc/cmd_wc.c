@@ -40,6 +40,19 @@ static void build_wc_argtable(
     tbl[8] = NULL;
 }
 
+/* MCP introspection hook (see cmd_spec_t.build_argtable): build the table into
+ * the caller's stack array so the schema layer can read each arg's type. The
+ * caller frees with arg_freetable(tbl, 8). */
+static int wc_build_argtable(void **tbl, int maxn)
+{
+    if (maxn < 9) return -1;
+    struct arg_lit  *help, *lines, *words, *bytes, *chars, *json;
+    struct arg_file *files;
+    struct arg_end  *end;
+    build_wc_argtable(&help, &lines, &words, &bytes, &chars, &json, &files, &end, tbl);
+    return 8;   /* tbl[0..7] populated; tbl[8] = NULL */
+}
+
 /* --------------------------------------------------------------------------
  * counting
  * -------------------------------------------------------------------------- */
@@ -230,4 +243,5 @@ cmd_spec_t cmd_wc_spec = {
                   "Use --json for stable machine-readable output.",
     .run         = wc_run,
     .print_usage = wc_print_usage,
+    .build_argtable = wc_build_argtable,
 };

@@ -960,23 +960,40 @@ echo 'ls apps | wc -l' | shell/mysh
 
 #### Natural-language `@` prefix
 
-When an **interactive** line's first non-whitespace character is `@`, the shell bypasses tokenization and pipeline parsing entirely. The rest of the line is taken as a raw prompt and forwarded — using the `fetch` command's logic in-process — over TCP to a line server at `localhost:5001`, and the server's reply is printed back to you.
+When an **interactive** line's first non-whitespace character is `@`, the shell bypasses tokenization and pipeline parsing entirely. The rest of the line is taken as a natural-language prompt and run through a **Suggest → Confirm → Execute** pipeline:
+
+1. **Suggest** — the prompt is forwarded (reusing the `fetch` command's logic in-process) over TCP to a line server at `localhost:5001`, which replies with a single rahulbox command line. The reply is captured into a buffer rather than printed.
+2. **Confirm** — the suggestion is shown under a `mysh (AI Suggestion)>` banner and you are asked `Execute this command? [y/N]:`.
+3. **Execute** — on `y`/`Y`, the **exact** suggested line is fed through the same engine a typed command uses (`tok_split` → pipeline parse → run). Any other key — including a bare Enter — prints `Aborted.` and sets `$?` to 1 without running anything.
 
 ```sh
-mysh> @ list files in detail
-ls -la — lists every entry with permissions, owner, and size
+mysh> @ show the first few README lines that mention rahulbox
+mysh (AI Suggestion)> cat README.md | grep rahulbox | head
+Execute this command? [y/N]: y
+Executing: cat README.md | grep rahulbox | head
+# ...matching lines from README.md...
 ```
 
 - One optional pair of surrounding quotes is stripped: `@ "list files"` sends `list files`.
 - An empty prompt (`@` alone) reports an error and sets `$?` to 1.
-- If the server is unreachable, `fetch`'s `Connection refused` is printed to stderr and the shell continues normally.
+- **Gateway unreachable / no command** — if `fetch` can't reach the gateway (or it returns no usable command), the shell reports the failure and prints a deterministic **offline heuristic hint** (`mysh (offline hint)> …`) keyed off the prompt, instead of opening the confirmation gate. Nothing runs.
 - `@` is an **interactive-only** convenience: in a script or piped input it is skipped with a notice on stderr (so non-interactive runs stay offline and deterministic), and the rest of the script runs.
 
 The endpoint is `AI_HOST`/`AI_PORT` in `shell/mysh.c`. Any line server that reads a newline-terminated request and replies with one line works as the backend — see the `fetch` command for the protocol.
 
+##### Command catalog (`mysh --commands-json`)
+
+`mysh --commands-json` is a boot-time global flag: instead of starting the interactive shell, it prints the in-process command registry as a single JSON array and exits `0`. Each element is `{ "name", "summary", "usage": [...] }`, where `usage` is the command's own `print_usage()` output (the same `argtable3` help a human sees) captured and split into lines, JSON-escaped so it ingests cleanly with `json.loads()`:
+
+```sh
+./shell/mysh --commands-json | python3 -m json.tool | head
+```
+
+This is the shell's MCP-style **tool catalog** — a static, machine-readable manifest an agent can read once to discover every command and its options without running anything. The AI gateway consumes it to build its system prompt, so adding a command to the shell automatically updates the AI's known vocabulary; there is no hand-maintained command list.
+
 ##### AI gateway setup (`ai_gateway.py`)
 
-The repo ships `ai_gateway.py`, a dependency-free Python bridge that serves that endpoint and forwards `@` prompts to a free-tier model on [OpenRouter](https://openrouter.ai). It uses only the standard library (`socket` + `urllib` — no `pip install`) and sandboxes the model with a system prompt that restricts every suggestion to rahulbox's 15 built-in apps and `|` pipelines (never `cp`/`mv`/`rm`/`find`/`awk`/`sed`, nor `&&`/`||`/`;`). Each reply is collapsed to a single newline-terminated line to match `fetch`'s line protocol, and every error path returns one clean line so the shell never hangs.
+The repo ships `ai_gateway.py`, a dependency-free Python bridge that serves that endpoint and forwards `@` prompts to a model on [OpenRouter](https://openrouter.ai). It uses only the standard library (`socket` + `urllib` + `subprocess` — no `pip install`). At startup it runs `./shell/mysh --commands-json` (the [command catalog](#command-catalog-mysh---commands-json)) to load the shell's live command set, and builds a system prompt that turns the model into a **deterministic command-translation engine**: it may use *only* the commands and exact flags in that catalog (`|` pipelines only — never `cp`/`mv`/`rm`/`find`/`awk`/`sed`, nor `&&`/`||`/`;`) and must emit **only** a bare command line — no markdown, prose, or explanation. (If the catalog can't be loaded it falls back to a built-in 15-app list and logs it.) Each reply is collapsed to a single newline-terminated line to match `fetch`'s line protocol, and every error path returns one clean line so the shell never hangs.
 
 ```sh
 # 1. Get a free API key from https://openrouter.ai/keys
@@ -995,9 +1012,10 @@ Configuration (all optional except the key) via environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `OPENROUTER_API_KEY` | _(required)_ | OpenRouter API key; without it every prompt returns a one-line config error |
-| `AI_GATEWAY_MODEL` | `meta-llama/llama-3.2-3b-instruct:free` | OpenRouter model id. Free models are rate-limited and the catalog changes over time; `openai/gpt-oss-20b:free` is a slower but reliably-available alternative (raise the timeouts for it) |
+| `AI_GATEWAY_MODEL` | `google/gemini-2.5-flash` | OpenRouter model id. The default is a fast paid model that fits the shell's 5s budget; any `:free` model also works for zero-cost testing (free models are rate-limited and churn over time) |
 | `AI_GATEWAY_TIMEOUT` | `4.5` | Seconds to wait for OpenRouter before returning a one-line error |
 | `AI_GATEWAY_HOST` / `AI_GATEWAY_PORT` | `127.0.0.1` / `5001` | Bind address (must match `AI_HOST`/`AI_PORT` in the shell) |
+| `AI_GATEWAY_MYSH` | `./shell/mysh` (resolved next to the script) | Path to the compiled shell; its `--commands-json` output builds the tool catalog |
 
 **Timeouts — keep the two in sync.** The shell's `fetch` aborts a reply that takes longer than **5 seconds** by default, which is tight for a live LLM round-trip. Raise it for the `@` path with `RAHULBOX_AI_TIMEOUT` (the shell forwards it to `fetch` as `-t SECS`; `0` = wait indefinitely), and set the gateway's own `AI_GATEWAY_TIMEOUT` just *under* the shell's so a slow model yields a clean one-line error instead of being cut off mid-reply:
 

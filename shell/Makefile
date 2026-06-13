@@ -6,6 +6,14 @@ ARGTABLE_DIR = ../vendor/argtable3
 ARGTABLE_INC = -I$(ARGTABLE_DIR)
 ARGTABLE_SRC = $(ARGTABLE_DIR)/argtable3.c
 
+# jsmn: header-only JSON parser. Compiled to a single jsmn.o here (this is the
+# one TU that pulls in its implementation); every other source includes jsmn.h
+# with JSMN_HEADER defined, so there are no duplicate symbols — same discipline
+# as argtable3.o above.
+JSMN_DIR = ../vendor/jsmn
+JSMN_INC = -I$(JSMN_DIR)
+JSMN_SRC = $(JSMN_DIR)/jsmn.c
+
 # Link cmd_*.o directly (one argtable3.o avoids duplicate symbols from .a files)
 APP_OBJS = ../apps/hello/cmd_hello.o \
            ../apps/ls/cmd_ls.o       \
@@ -48,11 +56,11 @@ apps:
 	$(MAKE) -C ../apps/mkdir
 	$(MAKE) -C ../apps/ftpd
 
-mysh: mysh.o tok.o linedit.o argtable3.o $(APP_OBJS)
+mysh: mysh.o tok.o linedit.o argtable3.o jsmn.o $(APP_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 mysh.o: mysh.c tok.h linedit.h
-	$(CC) $(CFLAGS) $(ARGTABLE_INC) -c -o $@ $<
+	$(CC) $(CFLAGS) $(ARGTABLE_INC) $(JSMN_INC) -c -o $@ $<
 
 tok.o: tok.c tok.h
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -63,5 +71,8 @@ linedit.o: linedit.c linedit.h
 argtable3.o: $(ARGTABLE_SRC)
 	$(CC) $(CFLAGS) $(ARGTABLE_INC) -c -o $@ $<
 
+jsmn.o: $(JSMN_SRC)
+	$(CC) $(CFLAGS) $(JSMN_INC) -c -o $@ $<
+
 clean:
-	rm -f mysh mysh.o tok.o linedit.o argtable3.o
+	rm -f mysh mysh.o tok.o linedit.o argtable3.o jsmn.o

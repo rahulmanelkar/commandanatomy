@@ -31,6 +31,9 @@
 #include <pthread.h>
 
 #include "../include/cmd_spec.h"
+#include "argtable3.h"      /* arg_hdr introspection for MCP inputSchema */
+#define JSMN_HEADER         /* declarations only; implementation links from jsmn.o */
+#include "jsmn.h"
 #include "tok.h"
 #include "linedit.h"
 
@@ -95,6 +98,278 @@ static void reg_print_all(void)
 {
     for (int i = 0; i < registry_n; i++)
         printf("  %-16s %s\n", registry[i]->name, registry[i]->summary);
+}
+
+/* ── --commands-json: export the registry as an MCP-style tool catalog ───────
+ *
+ * Emit a single top-level JSON array describing every registered command so an
+ * AI agent can discover the shell's capabilities without running anything. Each
+ * element is { "name", "summary", "usage": [ ...lines... ] }, where the usage
+ * lines are captured from the command's own print_usage() — the same argtable3
+ * help text a human sees — so the catalog and --help can never drift apart.
+ */
+
+/* Write s[0..len) to `out` as a JSON string literal (quotes included), escaping
+ * the characters JSON requires plus every C0 control char as \u00XX. Raw UTF-8
+ * bytes (>= 0x80) pass through verbatim, which is valid JSON. */
+static void json_write_string(FILE *out, const char *s, size_t len)
+{
+    fputc('"', out);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+            case '"':  fputs("\\\"", out); break;
+            case '\\': fputs("\\\\", out); break;
+            case '\b': fputs("\\b",  out); break;
+            case '\f': fputs("\\f",  out); break;
+            case '\n': fputs("\\n",  out); break;
+            case '\r': fputs("\\r",  out); break;
+            case '\t': fputs("\\t",  out); break;
+            default:
+                if (c < 0x20) fprintf(out, "\\u%04x", c);
+                else          fputc((int)c, out);
+        }
+    }
+    fputc('"', out);
+}
+
+/* Run spec->print_usage() into an in-memory buffer and return it (caller frees);
+ * *out_len receives the byte count. Returns NULL on allocation failure or if the
+ * command has no print_usage. */
+static char *capture_usage(const cmd_spec_t *spec, size_t *out_len)
+{
+    *out_len = 0;
+    if (!spec->print_usage) return NULL;
+
+    char  *buf  = NULL;
+    size_t size = 0;
+    FILE  *mem  = open_memstream(&buf, &size);   /* glibc, needs _GNU_SOURCE */
+    if (!mem) return NULL;
+
+    spec->print_usage(mem);
+    fclose(mem);                                  /* flushes; buf/size now set */
+    *out_len = size;
+    return buf;
+}
+
+/* Emit the captured usage text as a JSON array of trimmed, non-blank lines onto
+ * `out`. Leading indentation is stripped and whitespace-only lines dropped so
+ * the array is a clean, flat list of usage/option lines. */
+static void json_write_usage_array(FILE *out, const char *text, size_t len)
+{
+    fputs("[", out);
+    int first = 1;
+    size_t start = 0;
+    for (size_t j = 0; j <= len; j++) {
+        if (j != len && text[j] != '\n') continue;
+
+        /* line is text[start..j); drop a trailing CR if present */
+        size_t s = start, e = j;
+        if (e > s && text[e - 1] == '\r') e--;
+        /* trim leading whitespace */
+        while (s < e && (text[s] == ' ' || text[s] == '\t')) s++;
+
+        /* skip blank lines */
+        int blank = 1;
+        for (size_t k = s; k < e; k++)
+            if (!isspace((unsigned char)text[k])) { blank = 0; break; }
+
+        if (!blank) {
+            fputs(first ? "\n        " : ",\n        ", out);
+            json_write_string(out, text + s, e - s);
+            first = 0;
+        }
+        start = j + 1;
+    }
+    fputs(first ? "]" : "\n      ]", out);   /* "[]" when no usage lines */
+}
+
+/* Print the whole registry as one valid JSON array on stdout. */
+static void dump_commands_json(void)
+{
+    printf("[");
+    for (int i = 0; i < registry_n; i++) {
+        const cmd_spec_t *spec = registry[i];
+        const char *name    = spec->name    ? spec->name    : "";
+        const char *summary = spec->summary ? spec->summary : "";
+
+        printf("%s\n  {\n", i ? "," : "");
+
+        printf("    \"name\": ");
+        json_write_string(stdout, name, strlen(name));
+        printf(",\n    \"summary\": ");
+        json_write_string(stdout, summary, strlen(summary));
+
+        size_t ulen = 0;
+        char  *usage = capture_usage(spec, &ulen);
+        printf(",\n    \"usage\": ");
+        json_write_usage_array(stdout, usage ? usage : "", ulen);
+        free(usage);
+
+        printf("\n  }");
+    }
+    printf("%s]\n", registry_n ? "\n" : "");
+}
+
+/* ── --mcp-tools: emit a spec-compliant MCP tools/list result ────────────────
+ *
+ * Where --commands-json emits human help text, this derives a typed JSON-Schema
+ * `inputSchema` per command by introspecting its argtable3 objects via the
+ * cmd_spec_t.build_argtable hook. Type mapping:
+ *     arg_lit (no value)         -> "boolean"
+ *     arg_int                    -> "integer"
+ *     arg_dbl                    -> "number"
+ *     arg_str / arg_file / other -> "string"
+ *     any arg with mincount > 0  -> added to "required"
+ * Every allocation is stack-local and freed before return, so this is safe to
+ * run on a worker thread (no static/global state). */
+
+#define MCP_ARGTABLE_MAX 32
+
+/* JSON property name for one arg: first long option, else the short-option
+ * char, else (a positional) a lowercased alphanumeric squeeze of its datatype,
+ * e.g. "[FILE...]" -> "file", "PATTERN" -> "pattern". */
+static void mcp_prop_name(const struct arg_hdr *h, char *buf, size_t cap)
+{
+    size_t i = 0;
+    if (h->longopts && *h->longopts) {
+        for (const char *p = h->longopts; *p && *p != ',' && i + 1 < cap; p++)
+            buf[i++] = *p;
+    } else if (h->shortopts && *h->shortopts) {
+        buf[i++] = h->shortopts[0];
+    } else {
+        const char *dt = h->datatype ? h->datatype : "";
+        for (const char *p = dt; *p && i + 1 < cap; p++)
+            if (isalnum((unsigned char)*p))
+                buf[i++] = (char)tolower((unsigned char)*p);
+    }
+    if (i == 0 && cap > 3) { buf[i++] = 'a'; buf[i++] = 'r'; buf[i++] = 'g'; }
+    buf[i] = '\0';
+}
+
+/* Skip the arg_end terminator and the universal --help flag (not a tool arg). */
+static int mcp_is_property(const struct arg_hdr *h)
+{
+    if (!h || (h->flag & ARG_TERMINATOR)) return 0;
+    if (h->longopts && strcmp(h->longopts, "help") == 0) return 0;
+    return 1;
+}
+
+static void write_mcp_input_schema(FILE *out, const cmd_spec_t *spec)
+{
+    /* No introspection hook: still emit a valid (open) object schema. */
+    if (!spec->build_argtable) {
+        fputs("{ \"type\": \"object\", \"properties\": {} }", out);
+        return;
+    }
+
+    void *tbl[MCP_ARGTABLE_MAX];
+    int n = spec->build_argtable(tbl, MCP_ARGTABLE_MAX);
+    if (n < 0) {
+        fputs("{ \"type\": \"object\", \"properties\": {} }", out);
+        return;
+    }
+
+    /* argtable3 assigns one fixed scanfn per value type, so pointer-equality
+     * classifies an arg even when the builder overrode its datatype string. */
+    struct arg_int *ref_int = arg_int0(NULL, "i", NULL, NULL);
+    struct arg_dbl *ref_dbl = arg_dbl0(NULL, "d", NULL, NULL);
+    arg_scanfn *int_scan = ref_int ? ref_int->hdr.scanfn : NULL;
+    arg_scanfn *dbl_scan = ref_dbl ? ref_dbl->hdr.scanfn : NULL;
+
+    fputs("{\n        \"type\": \"object\",\n        \"properties\": {", out);
+
+    int props = 0;
+    for (int i = 0; i < n; i++) {
+        struct arg_hdr *h = (struct arg_hdr *)tbl[i];   /* hdr is the first member */
+        if (!mcp_is_property(h)) continue;
+
+        const char *type;
+        if (!(h->flag & ARG_HASVALUE))               type = "boolean"; /* arg_lit */
+        else if (int_scan && h->scanfn == int_scan)  type = "integer";
+        else if (dbl_scan && h->scanfn == dbl_scan)  type = "number";
+        else                                         type = "string";  /* str/file */
+
+        char name[64];
+        mcp_prop_name(h, name, sizeof name);
+
+        fputs(props++ ? ",\n          " : "\n          ", out);
+        json_write_string(out, name, strlen(name));
+        fputs(": { \"type\": ", out);
+        json_write_string(out, type, strlen(type));
+        if (h->glossary && *h->glossary) {
+            fputs(", \"description\": ", out);
+            json_write_string(out, h->glossary, strlen(h->glossary));
+        }
+        fputs(" }", out);
+    }
+    fputs(props ? "\n        }" : "}", out);
+
+    /* required[]: any arg with mincount > 0 (covers required positionals). */
+    int reqs = 0;
+    for (int i = 0; i < n; i++) {
+        struct arg_hdr *h = (struct arg_hdr *)tbl[i];
+        if (!mcp_is_property(h) || h->mincount <= 0) continue;
+        char name[64];
+        mcp_prop_name(h, name, sizeof name);
+        fputs(reqs++ ? ", " : ",\n        \"required\": [", out);
+        json_write_string(out, name, strlen(name));
+    }
+    if (reqs) fputc(']', out);
+
+    fputs("\n      }", out);
+
+    arg_freetable(tbl, (size_t)n);             /* free the command's table */
+    void *reftab[2]; int rn = 0;               /* and the reference objects */
+    if (ref_int) reftab[rn++] = ref_int;
+    if (ref_dbl) reftab[rn++] = ref_dbl;
+    arg_freetable(reftab, (size_t)rn);
+}
+
+/* Emit the MCP ListToolsResult: { "tools": [ {name, description, inputSchema} ] }.
+ * The JSON-RPC 2.0 envelope (jsonrpc/id/result) is added by the Phase 2 server
+ * dispatch; this is the `result` payload a `tools/list` call returns. */
+static void dump_mcp_tools(void)
+{
+    printf("{\n  \"tools\": [");
+    for (int i = 0; i < registry_n; i++) {
+        const cmd_spec_t *spec = registry[i];
+        const char *name = spec->name ? spec->name : "";
+        const char *desc = spec->summary ? spec->summary : "";
+
+        printf("%s\n    {\n      \"name\": ", i ? "," : "");
+        json_write_string(stdout, name, strlen(name));
+        printf(",\n      \"description\": ");
+        json_write_string(stdout, desc, strlen(desc));
+        printf(",\n      \"inputSchema\": ");
+        write_mcp_input_schema(stdout, spec);
+        printf("\n    }");
+    }
+    printf("%s]\n}\n", registry_n ? "\n  " : "");
+}
+
+/* --jsmn-selftest: prove the vendored parser links and runs (Phase 2 will use
+ * it to parse inbound JSON-RPC). Zero-allocation: tokens live on the stack. */
+static int mcp_jsmn_selftest(void)
+{
+    static const char *sample =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}";
+    jsmn_parser p;
+    jsmntok_t   tok[32];
+    jsmn_init(&p);
+    int n = jsmn_parse(&p, sample, strlen(sample), tok, 32);
+    if (n < 0) { fprintf(stderr, "jsmn: parse error %d\n", n); return 1; }
+    printf("jsmn: parsed %d tokens from a sample JSON-RPC request\n", n);
+    for (int i = 0; i + 1 < n; i++) {
+        int len = tok[i].end - tok[i].start;
+        if (tok[i].type == JSMN_STRING && len == 6 &&
+            strncmp(sample + tok[i].start, "method", 6) == 0) {
+            printf("jsmn: method = %.*s\n",
+                   tok[i + 1].end - tok[i + 1].start, sample + tok[i + 1].start);
+            break;
+        }
+    }
+    return 0;
 }
 
 /* ── pipeline structures ────────────────────────────────────────────────── */
@@ -522,22 +797,81 @@ static void setup_path(void)
     setenv("PATH", new_path, 1);
 }
 
-/*
- * Forward a natural-language prompt to the AI mock endpoint by reusing the
- * fetch command's logic in-process (cmd_fetch_spec.run) — no fork, no second
- * parse.  The prompt becomes fetch's MESSAGE positional; the "--" guards
- * prompts that happen to start with '-'.  fetch writes the server's reply to
- * out_stream itself, so the suggestion lands cleanly on the user's stream.
+/* ── '@' natural-language mode: Suggest → Confirm → Execute ──────────────────
  *
- * If $RAHULBOX_AI_TIMEOUT is set, its value is forwarded as fetch's `-t SECS`
- * so a slow LLM gateway gets more than the 5s default; fetch validates it and
- * reports any out-of-range value. Returns fetch's exit code.
- */
-static int run_at_prompt(const char *prompt, FILE *in, FILE *out)
+ * contains_ci: case-insensitive substring test used only by the offline
+ * heuristic below. */
+static int contains_ci(const char *hay, const char *needle)
 {
-    const char *timeout = getenv(AI_TIMEOUT_ENV);
+    size_t nl = strlen(needle);
+    if (nl == 0) return 1;
+    for (const char *h = hay; *h; h++) {
+        size_t i = 0;
+        while (i < nl && tolower((unsigned char)h[i]) ==
+                         tolower((unsigned char)needle[i]))
+            i++;
+        if (i == nl) return 1;
+    }
+    return 0;
+}
 
-    /* fetch -H HOST -p PORT [-t SECS] -- PROMPT : at most 9 args + NULL. */
+/*
+ * Deterministic, offline fallback for when the AI gateway can't be reached.
+ * Maps a few keywords in the prompt to a suggested rahulbox pipeline so the
+ * user still gets a useful pointer with no network round-trip. Never executes
+ * anything — without the gateway there is nothing trustworthy to confirm, so we
+ * only print a hint.
+ */
+static void ai_fallback_hint(const char *prompt, FILE *out)
+{
+    const char *hint;
+    if      (contains_ci(prompt, "count") || contains_ci(prompt, "how many"))
+        hint = "wc FILE";
+    else if (contains_ci(prompt, "search") || contains_ci(prompt, "find") ||
+             contains_ci(prompt, "contain") || contains_ci(prompt, "match") ||
+             contains_ci(prompt, "grep"))
+        hint = "grep PATTERN FILE   (or: cat FILE | grep PATTERN)";
+    else if (contains_ci(prompt, "sort"))
+        hint = "sort FILE   (add | uniq to drop duplicates)";
+    else if (contains_ci(prompt, "first") || contains_ci(prompt, "head") ||
+             contains_ci(prompt, "top"))
+        hint = "head FILE";
+    else if (contains_ci(prompt, "last") || contains_ci(prompt, "tail") ||
+             contains_ci(prompt, "end"))
+        hint = "tail FILE";
+    else if (contains_ci(prompt, "show") || contains_ci(prompt, "read") ||
+             contains_ci(prompt, "print") || contains_ci(prompt, "content") ||
+             contains_ci(prompt, "cat"))
+        hint = "cat FILE";
+    else if (contains_ci(prompt, "list") || contains_ci(prompt, "file") ||
+             contains_ci(prompt, "dir"))
+        hint = "ls   (add -a to include hidden entries)";
+    else
+        hint = "help   (lists every command rahulbox can run)";
+
+    fprintf(out, "mysh (offline hint)> %s\n", hint);
+    fflush(out);
+}
+
+/*
+ * Ask the gateway: run fetch in-process with its reply captured into a heap
+ * buffer (open_memstream) instead of printed. fetch reports transport failures
+ * on stderr and returns non-zero, so the return code distinguishes a real reply
+ * from a dead connection. *out_reply receives a trimmed, NUL-terminated copy
+ * (caller frees; may be empty/NULL). The "--" guards prompts starting with '-';
+ * $RAHULBOX_AI_TIMEOUT, if set, becomes fetch's -t SECS. Returns fetch's code,
+ * or -1 if the capture buffer could not be created.
+ */
+static int ai_query(const char *prompt, FILE *in, char **out_reply)
+{
+    *out_reply = NULL;
+
+    char  *buf  = NULL;
+    size_t size = 0;
+    FILE  *cap  = open_memstream(&buf, &size);
+    if (!cap) return -1;
+
+    const char *timeout = getenv(AI_TIMEOUT_ENV);
     char *fargv[10];
     int   fargc = 0;
     fargv[fargc++] = "fetch";
@@ -553,7 +887,110 @@ static int run_at_prompt(const char *prompt, FILE *in, FILE *out)
     fargv[fargc++] = (char *)prompt;
     fargv[fargc]   = NULL;
 
-    return cmd_fetch_spec.run(fargc, fargv, in, out);
+    int rc = cmd_fetch_spec.run(fargc, fargv, in, cap);
+    fclose(cap);                 /* flush; buf/size now valid */
+
+    /* Strip the trailing CR/LF/space the line protocol leaves on the reply. */
+    while (size > 0 && (buf[size - 1] == '\n' || buf[size - 1] == '\r' ||
+                        buf[size - 1] == ' '  || buf[size - 1] == '\t'))
+        buf[--size] = '\0';
+
+    *out_reply = buf;
+    return rc;
+}
+
+/*
+ * The '@' interactive hook: a Suggest → Confirm → Execute state machine.
+ *
+ *   1. Suggest  ask the gateway (fetch, in-process) and capture its one line of
+ *               advice rather than printing it.
+ *   2. Confirm  echo it under a "mysh (AI Suggestion)>" banner and require an
+ *               explicit y/Y at a [y/N] gate before anything runs.
+ *   3. Execute  on y, feed the EXACT suggested line through the same engine a
+ *               typed command uses: tok_split() → parse_pipeline() →
+ *               run_pipeline(). Any other key — including a bare Enter — prints
+ *               "Aborted." and returns 1 without running a thing.
+ *
+ * If fetch can't reach the gateway (non-zero exit) or the gateway returns no
+ * usable command, the gate is bypassed and a deterministic offline heuristic
+ * hint is printed instead. Returns the executed pipeline's status, or 1 on
+ * abort / gateway failure.
+ */
+static int run_at_prompt(const char *prompt, FILE *in, FILE *out)
+{
+    /* ── 1. Suggestion phase ─────────────────────────────────────────────── */
+    char *reply = NULL;
+    int   frc   = ai_query(prompt, in, &reply);
+
+    const char *sug = reply ? reply : "";
+    while (*sug == ' ' || *sug == '\t') sug++;   /* skip leading whitespace */
+
+    /* ── 4. Deterministic fallback: unreachable gateway / no command ─────── */
+    int unreachable = (frc != 0);
+    int no_command  = (!unreachable &&
+                       (*sug == '\0' || strncmp(sug, "rahulbox AI", 11) == 0));
+    if (unreachable || no_command) {
+        if (unreachable)
+            fprintf(stderr,
+                    "mysh: @: AI gateway unreachable (fetch exited %d).\n", frc);
+        else
+            fprintf(stderr, "mysh: @: AI gateway returned no command%s%s\n",
+                    (*sug ? ": " : "."), sug);
+        ai_fallback_hint(prompt, out);
+        free(reply);
+        return 1;
+    }
+
+    /* ── 2. Confirmation gate ────────────────────────────────────────────── */
+    fprintf(out, "mysh (AI Suggestion)> %s\n", sug);
+    fflush(out);
+
+    char answer[64];
+    if (linedit_read(in, "Execute this command? [y/N]: ",
+                     answer, sizeof answer) < 0) {
+        fprintf(out, "\nAborted.\n");            /* EOF / Ctrl-D at the gate */
+        free(reply);
+        return 1;
+    }
+
+    const char *a = answer;
+    while (*a == ' ' || *a == '\t') a++;
+    if (*a != 'y' && *a != 'Y') {
+        fprintf(out, "Aborted.\n");
+        free(reply);
+        return 1;
+    }
+
+    /* ── 3. Execution phase: route the exact line through the real engine ── */
+    fprintf(out, "Executing: %s\n", sug);
+    fflush(out);
+
+    tok_t tok;
+    if (tok_split(sug, &tok, 0) < 0) {
+        fprintf(stderr, "mysh: @: could not tokenize suggestion "
+                        "(unmatched quote?)\n");
+        free(reply);
+        return 1;
+    }
+    if (tok.n == 0) {
+        tok_free(&tok);
+        free(reply);
+        return 1;
+    }
+
+    stage_t stages[PIPELINE_MAX];
+    int nstages = 0;
+    if (parse_pipeline(&tok, stages, &nstages) < 0 || nstages == 0) {
+        fprintf(stderr, "mysh: @: malformed pipeline in suggestion\n");
+        tok_free(&tok);
+        free(reply);
+        return 1;
+    }
+
+    int status = run_pipeline(stages, nstages);
+    tok_free(&tok);
+    free(reply);
+    return status;
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
@@ -578,6 +1015,22 @@ int main(int argc, char **argv)
     reg_register(&cmd_fetch_spec);
     reg_register(&cmd_mkdir_spec);
     reg_register(&cmd_ftpd_spec);
+
+    /* ── --commands-json: boot-time tool-catalog export ─────────────────────
+     * Must run after the registry is fully populated but before any
+     * interactive/script setup. Dump the registry as JSON and exit 0 so an AI
+     * agent can ingest the catalog with a plain `mysh --commands-json`. */
+    if (argc >= 2 && strcmp(argv[1], "--commands-json") == 0) {
+        dump_commands_json();
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--mcp-tools") == 0) {
+        dump_mcp_tools();
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--jsmn-selftest") == 0) {
+        return mcp_jsmn_selftest();
+    }
 
     setup_path();
 

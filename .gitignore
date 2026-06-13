@@ -26,3 +26,7 @@ prompt_history.md
 
 # Claude Code internals
 .claude/
+
+# Python bytecode (e.g. from ai_gateway.py imports during testing)
+__pycache__/
+*.pyc
