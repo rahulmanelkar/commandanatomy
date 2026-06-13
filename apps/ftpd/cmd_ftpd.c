@@ -23,15 +23,19 @@ extern cmd_spec_t cmd_ls_spec;
 extern cmd_spec_t cmd_mkdir_spec;
 
 #define FTPD_DEFAULT_PORT 21021
+#define FTPD_DEFAULT_USER "rahulbox"
+#define FTPD_DEFAULT_PASS "rahulbox"
 #define CTL_LINE_MAX      2048
 #define XFER_BUF          65536
 
-/* Per-connection descriptor handed to each worker thread. Everything else a
- * session needs (login state, decoded PORT address) lives on the worker's own
- * stack, so concurrent clients never share mutable state. */
+/* Per-connection descriptor handed to each worker thread. The expected
+ * credentials point at storage that outlives every worker (argtable values or
+ * string literals), so they can be shared read-only across threads. */
 typedef struct {
-    int ctl_fd;
-    int timeout;              /* idle seconds on the control channel; 0 = none */
+    int         ctl_fd;
+    int         timeout;      /* idle seconds on the control channel; 0 = none */
+    const char *user;         /* username a client must supply */
+    const char *pass;         /* password a client must supply */
 } conn_ctx_t;
 
 /* Per-session data channel. A transfer is served either actively (connect back
@@ -52,22 +56,28 @@ static void build_ftpd_argtable(
     struct arg_lit **help,
     struct arg_int **port,
     struct arg_int **timeout,
+    struct arg_str **user,
+    struct arg_str **pass,
     struct arg_lit **json,
     struct arg_end **end,
-    void           **tbl)         /* caller-allocated array of 6 slots */
+    void           **tbl)         /* caller-allocated array of 8 slots */
 {
     *help    = arg_lit0("h", "help",    "show this help and exit");
     *port    = arg_int0("p", "port",    "PORT", "listen port (default 21021)");
     *timeout = arg_int0("t", "timeout", "SECS", "idle timeout per connection, seconds (0 = none)");
+    *user    = arg_str0("u", "user",    "NAME", "username clients must log in as (default \"rahulbox\")");
+    *pass    = arg_str0(NULL, "pass",   "WORD", "password clients must supply (default \"rahulbox\")");
     *json    = arg_lit0(NULL, "json",   "emit a machine-readable JSON status log");
     *end     = arg_end(20);
 
     tbl[0] = *help;
     tbl[1] = *port;
     tbl[2] = *timeout;
-    tbl[3] = *json;
-    tbl[4] = *end;
-    tbl[5] = NULL;
+    tbl[3] = *user;
+    tbl[4] = *pass;
+    tbl[5] = *json;
+    tbl[6] = *end;
+    tbl[7] = NULL;
 }
 
 /* --------------------------------------------------------------------------
@@ -364,7 +374,9 @@ static void *ConnectionHandler(void *arg)
     int ctl = ctx->ctl_fd;
 
     /* Session state — entirely on this thread's stack, isolated per client. */
-    int        logged_in = 0;
+    int        logged_in  = 0;
+    int        user_given = 0;       /* a USER was supplied, awaiting PASS */
+    char       acct[128]  = {0};     /* the username from the last USER */
     datachan_t dc;
     memset(&dc, 0, sizeof dc);
     dc.pasv_fd = -1;
@@ -392,8 +404,25 @@ static void *ConnectionHandler(void *arg)
         const char *verb = line;
 
         if (strcmp(verb, "USER") == 0) {
-            logged_in = 1;
-            ctl_reply(ctl, "230 Login successful.\r\n");
+            /* Always ask for a password; never reveal whether the name is valid. */
+            snprintf(acct, sizeof acct, "%s", arg ? arg : "");
+            user_given = 1;
+            logged_in  = 0;            /* a new USER must re-authenticate */
+            char reply[CTL_LINE_MAX];
+            snprintf(reply, sizeof reply, "331 Password required for %s.\r\n", acct);
+            ctl_reply(ctl, reply);
+        } else if (strcmp(verb, "PASS") == 0) {
+            const char *given = arg ? arg : "";
+            if (!user_given) {
+                ctl_reply(ctl, "503 Login with USER first.\r\n");
+            } else if (strcmp(acct, ctx->user) == 0 && strcmp(given, ctx->pass) == 0) {
+                logged_in = 1;
+                ctl_reply(ctl, "230 Login successful.\r\n");
+            } else {
+                logged_in  = 0;
+                user_given = 0;        /* force a fresh USER/PASS exchange */
+                ctl_reply(ctl, "530 Login incorrect.\r\n");
+            }
         } else if (strcmp(verb, "QUIT") == 0) {
             ctl_reply(ctl, "221 Goodbye.\r\n");
             break;                     /* close THIS connection only */
@@ -447,17 +476,18 @@ void ftpd_print_usage(FILE *out)
 {
     struct arg_lit *help, *json;
     struct arg_int *port, *timeout;
+    struct arg_str *user, *pass;
     struct arg_end *end;
-    void           *tbl[6];
+    void           *tbl[8];
 
-    build_ftpd_argtable(&help, &port, &timeout, &json, &end, tbl);
+    build_ftpd_argtable(&help, &port, &timeout, &user, &pass, &json, &end, tbl);
 
     fprintf(out, "Usage: ftpd ");
     arg_print_syntax(out, tbl, "\n");
     fprintf(out, "\nServe the current directory over a minimal multi-threaded FTP daemon.\n\nOptions:\n");
     arg_print_glossary(out, tbl, "  %-22s %s\n");
 
-    arg_freetable(tbl, 5);
+    arg_freetable(tbl, 7);
 }
 
 /* --------------------------------------------------------------------------
@@ -470,22 +500,23 @@ int ftpd_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
 
     struct arg_lit *help, *json;
     struct arg_int *port, *timeout;
+    struct arg_str *user, *pass;
     struct arg_end *end;
-    void           *tbl[6];
+    void           *tbl[8];
 
-    build_ftpd_argtable(&help, &port, &timeout, &json, &end, tbl);
+    build_ftpd_argtable(&help, &port, &timeout, &user, &pass, &json, &end, tbl);
 
     int nerrors = arg_parse(argc, argv, tbl);
 
     if (help->count > 0) {
         ftpd_print_usage(out_stream);
-        arg_freetable(tbl, 5);
+        arg_freetable(tbl, 7);
         return 0;
     }
     if (nerrors > 0) {
         arg_print_errors(stderr, end, "ftpd");
         fprintf(stderr, "Try 'ftpd --help' for more information.\n");
-        arg_freetable(tbl, 5);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
@@ -493,9 +524,14 @@ int ftpd_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     int conn_to     = timeout->count > 0 ? timeout->ival[0] : 0;
     int use_json    = json->count    > 0;
 
+    /* Expected credentials. These point into argtable/literal storage that lives
+     * for the whole daemon, so worker threads can share them read-only. */
+    const char *expect_user = user->count > 0 ? user->sval[0] : FTPD_DEFAULT_USER;
+    const char *expect_pass = pass->count > 0 ? pass->sval[0] : FTPD_DEFAULT_PASS;
+
     if (listen_port < 1 || listen_port > 65535) {
         fprintf(stderr, "ftpd: invalid port %d\n", listen_port);
-        arg_freetable(tbl, 5);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
@@ -505,7 +541,7 @@ int ftpd_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
         fprintf(stderr, "ftpd: socket: %s\n", strerror(errno));
-        arg_freetable(tbl, 5);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
@@ -521,22 +557,22 @@ int ftpd_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     if (bind(srv, (struct sockaddr *)&sa, sizeof sa) < 0) {
         fprintf(stderr, "ftpd: bind port %d: %s\n", listen_port, strerror(errno));
         close(srv);
-        arg_freetable(tbl, 5);
+        arg_freetable(tbl, 7);
         return 1;
     }
     if (listen(srv, 16) < 0) {
         fprintf(stderr, "ftpd: listen: %s\n", strerror(errno));
         close(srv);
-        arg_freetable(tbl, 5);
+        arg_freetable(tbl, 7);
         return 1;
     }
 
     if (use_json)
-        fprintf(out_stream, "{\"event\":\"listening\",\"port\":%d,\"timeout\":%d}\n",
-                listen_port, conn_to);
+        fprintf(out_stream, "{\"event\":\"listening\",\"port\":%d,\"timeout\":%d,\"user\":\"%s\"}\n",
+                listen_port, conn_to, expect_user);
     else
-        fprintf(out_stream, "ftpd: listening on port %d (timeout %ds; Ctrl-C to stop)\n",
-                listen_port, conn_to);
+        fprintf(out_stream, "ftpd: listening on port %d (user '%s', timeout %ds; Ctrl-C to stop)\n",
+                listen_port, expect_user, conn_to);
     fflush(out_stream);
 
     /* Accept loop: spawn a detached worker per client, then loop straight back
@@ -555,6 +591,8 @@ int ftpd_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
         if (!ctx) { close(cfd); continue; }
         ctx->ctl_fd  = cfd;
         ctx->timeout = conn_to;
+        ctx->user    = expect_user;
+        ctx->pass    = expect_pass;
 
         if (use_json)
             fprintf(out_stream, "{\"event\":\"accept\",\"peer\":\"%s:%d\"}\n",
@@ -575,7 +613,7 @@ int ftpd_run(int argc, char **argv, FILE *in_stream, FILE *out_stream)
     }
 
     close(srv);
-    arg_freetable(tbl, 5);
+    arg_freetable(tbl, 7);
     return 1;
 }
 
@@ -592,7 +630,9 @@ cmd_spec_t cmd_ftpd_spec = {
                   "NLST, MKD, RETR and STOR; LIST and MKD reuse the in-process ls and "
                   "mkdir command specs. Both active (PORT) and passive (PASV) data "
                   "connections work, so standard FTP clients (ftp, curl) connect "
-                  "out-of-the-box. Transfers are binary-safe.",
+                  "out-of-the-box. Clients authenticate with USER/PASS against the "
+                  "credentials set by --user/--pass (default rahulbox/rahulbox). "
+                  "Transfers are binary-safe.",
     .run         = ftpd_run,
     .print_usage = ftpd_print_usage,
 };

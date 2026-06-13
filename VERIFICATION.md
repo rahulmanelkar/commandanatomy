@@ -78,8 +78,14 @@ echo "hello from the server" > readme.txt
 ~/rahulbox/apps/ftpd/ftpd -p 21021 -t 60
 ```
 
-Expected: `ftpd: listening on port 21021 (timeout 60s; Ctrl-C to stop)`.
+Expected: `ftpd: listening on port 21021 (user 'rahulbox', timeout 60s; Ctrl-C to stop)`.
 It logs each connection. Stop it later with **Ctrl-C**.
+
+Clients must authenticate. The default credentials are **`rahulbox` / `rahulbox`**;
+override them with `--user NAME --pass WORD`, e.g.
+`ftpd -p 21021 --user alice --pass s3cret`. (The password is passed on the
+command line, so it is visible in `ps` — fine for local testing, not for real
+deployments.)
 
 > JSON log mode: `ftpd --json -p 21021` emits `{"event":"listening",...}` lines.
 
@@ -91,26 +97,26 @@ Passive is the default for modern clients, so **no special flags are needed**.
 
 ```bash
 # LIST
-curl -s --user me:x "ftp://127.0.0.1:21021/"
+curl -s --user rahulbox:rahulbox "ftp://127.0.0.1:21021/"
 
 # RETR (download)
-curl -s --user me:x "ftp://127.0.0.1:21021/readme.txt"
+curl -s --user rahulbox:rahulbox "ftp://127.0.0.1:21021/readme.txt"
 
 # STOR (upload)
 echo "uploaded content" > /tmp/up.txt
-curl -s --user me:x -T /tmp/up.txt "ftp://127.0.0.1:21021/up.txt"
+curl -s --user rahulbox:rahulbox -T /tmp/up.txt "ftp://127.0.0.1:21021/up.txt"
 cat /tmp/ftproot/up.txt           # verify it landed
 ```
 
 Expected: LIST prints `readme.txt`; RETR prints `hello from the server`;
-STOR lands `uploaded content` in `/tmp/ftproot/up.txt`. (Any username/password
-is accepted — there is no real auth.)
+STOR lands `uploaded content` in `/tmp/ftproot/up.txt`. With the wrong password
+(`--user rahulbox:nope`) curl fails with exit code 67 (login denied).
 
 **Interactive `ftp` client** (also passive by default):
 
 ```bash
 ftp -inv 127.0.0.1 21021 <<'EOF'
-user me x
+user rahulbox rahulbox
 get readme.txt /tmp/got.txt
 put /tmp/up.txt up2.txt
 mkdir madebyftp
@@ -125,17 +131,27 @@ transfer, `257 "madebyftp" created.`, and the final `ls` listing. Verify with
 
 ### 3.3 — Terminal B: control channel via `netcat` (no data connection)
 
-`USER`, `MKD`, and `QUIT` need no data connection, so plain `nc` works:
+`USER`/`PASS`, `MKD`, and `QUIT` need no data connection, so plain `nc` works.
+Note the two-step login: `USER` returns `331` (password required), then `PASS`
+returns `230`:
 
 ```bash
-printf 'USER me\r\nMKD newdir\r\nQUIT\r\n' | nc -w2 127.0.0.1 21021
+printf 'USER rahulbox\r\nPASS rahulbox\r\nMKD newdir\r\nQUIT\r\n' | nc -w2 127.0.0.1 21021
 ls -ld /tmp/ftproot/newdir
 ```
 
-Expected replies: `220`, `230 Login successful.`, `257 "newdir" created.`,
-`221 Goodbye.`, and `newdir` exists on disk.
+Expected replies: `220`, `331 Password required for rahulbox.`,
+`230 Login successful.`, `257 "newdir" created.`, `221 Goodbye.`, and `newdir`
+exists on disk.
 
-Confirm the **allowlist gate** (a command before `USER` is refused):
+A wrong password is rejected, and subsequent commands stay locked out:
+
+```bash
+printf 'USER rahulbox\r\nPASS wrong\r\nMKD nope\r\nQUIT\r\n' | nc -w2 127.0.0.1 21021
+# -> 331 ... / 530 Login incorrect. / 530 Not logged in. / 221
+```
+
+Confirm the **allowlist gate** (a command before login is refused):
 
 ```bash
 printf 'MKD nope\r\nQUIT\r\n' | nc -w2 127.0.0.1 21021   # -> 530 Not logged in
@@ -147,7 +163,7 @@ The daemon also speaks classic active mode. With `curl`, force it via `-P -`
 (use the local address) and `--disable-eprt` (use `PORT`, not `EPRT`):
 
 ```bash
-curl -s -P - --disable-eprt --user me:x "ftp://127.0.0.1:21021/"
+curl -s -P - --disable-eprt --user rahulbox:rahulbox "ftp://127.0.0.1:21021/"
 ```
 
 With the interactive `ftp` client, toggle passive off first: type `passive`
@@ -159,8 +175,8 @@ Works in either mode; this uses passive:
 
 ```bash
 head -c 16384 /dev/urandom > /tmp/bin.in        # random bytes, full of NULs
-curl -s --user me:x -T /tmp/bin.in "ftp://127.0.0.1:21021/bin.dat"
-curl -s --user me:x "ftp://127.0.0.1:21021/bin.dat" -o /tmp/bin.out
+curl -s --user rahulbox:rahulbox -T /tmp/bin.in "ftp://127.0.0.1:21021/bin.dat"
+curl -s --user rahulbox:rahulbox "ftp://127.0.0.1:21021/bin.dat" -o /tmp/bin.out
 cmp /tmp/bin.in /tmp/bin.out && echo "IDENTICAL — binary-safe, no NUL truncation"
 ```
 
@@ -170,7 +186,7 @@ Expected: `IDENTICAL — binary-safe, no NUL truncation`.
 
 ```bash
 for i in 1 2 3 4 5; do
-  curl -s --user u$i:x "ftp://127.0.0.1:21021/" >/dev/null &
+  curl -s --user rahulbox:rahulbox "ftp://127.0.0.1:21021/" >/dev/null &
 done; wait; echo "all concurrent clients done — daemon still listening"
 ```
 
@@ -206,8 +222,13 @@ rm -rf /tmp/ftproot /tmp/mk /tmp/lst /tmp/bin.* /tmp/up.txt /tmp/got.txt
   automatically; the daemon answers `PASV` with `227 Entering Passive Mode`.
 - **Active mode (`PORT`)** is still fully supported for clients/scripts that
   prefer it (`curl -P -`, or `passive` off in the `ftp` client).
-- **Auth is nominal.** Any `USER` succeeds (`230`); there is no `PASS` check.
-  This is a teaching-scale daemon serving its own working directory; `CWD` is
-  not implemented, so it always lists/serves the directory it was started in.
-- **Supported verbs:** `USER`, `QUIT`, `NOOP`, `TYPE`, `SYST`, `PWD`/`XPWD`,
-  `PORT`, `PASV`, `MKD`, `LIST`/`NLST`, `RETR`, `STOR`. Anything else → `502`.
+- **Authentication.** Clients log in with `USER` (→ `331`) then `PASS`
+  (→ `230` on success, `530` on failure). Credentials default to
+  `rahulbox`/`rahulbox` and are set with `--user`/`--pass`. A single account;
+  the username is never revealed as (in)valid until `PASS` is checked.
+- **Serving scope.** Teaching-scale daemon serving its own working directory;
+  `CWD` is not implemented, so it always lists/serves the directory it was
+  started in.
+- **Supported verbs:** `USER`, `PASS`, `QUIT`, `NOOP`, `TYPE`, `SYST`,
+  `PWD`/`XPWD`, `PORT`, `PASV`, `MKD`, `LIST`/`NLST`, `RETR`, `STOR`. Anything
+  else → `502`.
