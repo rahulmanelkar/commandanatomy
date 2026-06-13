@@ -995,7 +995,7 @@ Configuration (all optional except the key) via environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `OPENROUTER_API_KEY` | _(required)_ | OpenRouter API key; without it every prompt returns a one-line config error |
-| `AI_GATEWAY_MODEL` | `google/gemini-2.5-flash:free` | Model id (e.g. `meta-llama/llama-3-8b-instruct:free`) |
+| `AI_GATEWAY_MODEL` | `meta-llama/llama-3.2-3b-instruct:free` | OpenRouter model id. Free models are rate-limited and the catalog changes over time; `openai/gpt-oss-20b:free` is a slower but reliably-available alternative (raise the timeouts for it) |
 | `AI_GATEWAY_TIMEOUT` | `4.5` | Seconds to wait for OpenRouter before returning a one-line error |
 | `AI_GATEWAY_HOST` / `AI_GATEWAY_PORT` | `127.0.0.1` / `5001` | Bind address (must match `AI_HOST`/`AI_PORT` in the shell) |
 

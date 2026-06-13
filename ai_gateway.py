@@ -44,9 +44,14 @@ PORT = int(os.environ.get("AI_GATEWAY_PORT", "5001"))
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Hardcoded high-quality free-tier engine. Override with AI_GATEWAY_MODEL if you
-# prefer the other approved free option: "meta-llama/llama-3-8b-instruct:free".
-MODEL = os.environ.get("AI_GATEWAY_MODEL", "google/gemini-2.5-flash:free")
+# Default free-tier engine. NOTE: OpenRouter's free catalog churns — the
+# originally-specified "google/gemini-2.5-flash:free" and
+# "meta-llama/llama-3-8b-instruct:free" were both retired (the former now 404s).
+# This is a current, verified free model that's fast enough for the shell's 5s
+# budget. Override with AI_GATEWAY_MODEL. Free models are rate-limited; a slower
+# but reliably-available alternative is "openai/gpt-oss-20b:free" (raise
+# RAHULBOX_AI_TIMEOUT / AI_GATEWAY_TIMEOUT for it, as it can exceed 5s).
+MODEL = os.environ.get("AI_GATEWAY_MODEL", "meta-llama/llama-3.2-3b-instruct:free")
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
